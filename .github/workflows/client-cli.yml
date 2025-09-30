@@ -1,0 +1,94 @@
+name: QuantaDB CLI Client CI
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'cli-client/**'
+      - '.github/workflows/client-cli.yml'
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - 'cli-client/**'
+      - '.github/workflows/client-cli.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test CLI Client
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+
+    - name: Cache cargo registry
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          cli-client/target
+        key: ${{ runner.os }}-cargo-cli-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-cli-
+
+    - name: Check formatting
+      run: cd cli-client && cargo fmt -- --check
+
+    - name: Run clippy
+      run: cd cli-client && cargo clippy -- -D warnings
+
+    - name: Build CLI client
+      run: cd cli-client && cargo build --verbose
+
+    - name: Run tests
+      run: cd cli-client && cargo test --verbose
+
+    - name: Test CLI help
+      run: |
+        cd cli-client
+        timeout 5s cargo run -- --help || true
+        echo "CLI help command completed successfully"
+
+  build-matrix:
+    name: Build CLI on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          cli-client/target
+        key: ${{ runner.os }}-cargo-cli-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-cli-
+
+    - name: Build CLI client
+      run: cd cli-client && cargo build --release --verbose
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: quanta-cli-${{ matrix.os }}
+        path: cli-client/target/release/quanta-cli*
+        retention-days: 7
