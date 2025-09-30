@@ -1,0 +1,254 @@
+:root {
+  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+
+  color-scheme: light dark;
+  color: rgba(255, 255, 255, 0.87);
+  background-color: #242424;
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  -webkit-text-size-adjust: 100%;
+}
+
+a {
+  font-weight: 500;
+  color: #646cff;
+  text-decoration: inherit;
+}
+a:hover {
+  color: #535bf2;
+}
+
+body {
+  margin: 0;
+  display: flex;
+  place-items: center;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+h1 {
+  font-size: 3.2em;
+  line-height: 1.1;
+}
+
+button {
+  border-radius: 8px;
+  border: 1px solid transparent;
+  padding: 0.6em 1.2em;
+  font-size: 1em;
+  font-weight: 500;
+  font-family: inherit;
+  background-color: #1a1a1a;
+  color: white;
+  cursor: pointer;
+  transition: border-color 0.25s;
+}
+button:hover {
+  border-color: #646cff;
+}
+button:focus,
+button:focus-visible {
+  outline: 4px auto -webkit-focus-ring-color;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color: #213547;
+    background-color: #ffffff;
+  }
+  a:hover {
+    color: #747bff;
+  }
+  button {
+    background-color: #f9f9f9;
+    color: #213547;
+  }
+}
+
+.app {
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.header {
+  background-color: #1a1a1a;
+  padding: 1rem;
+  border-bottom: 1px solid #333;
+}
+
+.header h1 {
+  margin: 0;
+  font-size: 1.5rem;
+  color: #646cff;
+}
+
+.connection-panel {
+  padding: 1rem;
+  background-color: #2a2a2a;
+  border-bottom: 1px solid #333;
+}
+
+.connection-form {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+}
+
+.connection-form input {
+  padding: 0.5rem;
+  border: 1px solid #555;
+  border-radius: 4px;
+  background-color: #1a1a1a;
+  color: white;
+  font-size: 1rem;
+}
+
+.connection-form input:focus {
+  outline: none;
+  border-color: #646cff;
+}
+
+.status {
+  padding: 0.5rem 1rem;
+  border-radius: 4px;
+  font-weight: 500;
+}
+
+.status.connected {
+  background-color: #22c55e;
+  color: white;
+}
+
+.status.disconnected {
+  background-color: #ef4444;
+  color: white;
+}
+
+.main-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 1rem;
+  gap: 1rem;
+}
+
+.query-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.query-input {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.query-input textarea {
+  padding: 1rem;
+  border: 1px solid #555;
+  border-radius: 4px;
+  background-color: #1a1a1a;
+  color: white;
+  font-family: 'Courier New', monospace;
+  font-size: 1rem;
+  resize: vertical;
+  min-height: 100px;
+}
+
+.query-input textarea:focus {
+  outline: none;
+  border-color: #646cff;
+}
+
+.query-buttons {
+  display: flex;
+  gap: 1rem;
+}
+
+.results-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.results-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.results-content {
+  flex: 1;
+  background-color: #1a1a1a;
+  border: 1px solid #555;
+  border-radius: 4px;
+  padding: 1rem;
+  overflow: auto;
+}
+
+.results-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.results-table th,
+.results-table td {
+  padding: 0.5rem;
+  text-align: left;
+  border-bottom: 1px solid #555;
+}
+
+.results-table th {
+  background-color: #2a2a2a;
+  font-weight: 500;
+}
+
+.results-table tr:hover {
+  background-color: #2a2a2a;
+}
+
+.error-message {
+  color: #ef4444;
+  background-color: #2a1a1a;
+  padding: 1rem;
+  border-radius: 4px;
+  border: 1px solid #ef4444;
+}
+
+.success-message {
+  color: #22c55e;
+  background-color: #1a2a1a;
+  padding: 1rem;
+  border-radius: 4px;
+  border: 1px solid #22c55e;
+}
+
+.loading {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: #646cff;
+}
+
+.spinner {
+  width: 20px;
+  height: 20px;
+  border: 2px solid #555;
+  border-top: 2px solid #646cff;
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
