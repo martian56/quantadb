@@ -91,11 +91,11 @@ document.addEventListener('DOMContentLoaded', function() {
         shape.style.animationDelay = `${index * 0.5}s`;
     });
 
-    // Typing effect for hero title
-    const heroTitle = document.querySelector('.hero-title');
-    if (heroTitle) {
-        typeWriter(heroTitle, 100);
-    }
+    // Typing effect for hero title - disabled to prevent HTML rendering issues
+    // const heroTitle = document.querySelector('.hero-title');
+    // if (heroTitle) {
+    //     typeWriter(heroTitle, 100);
+    // }
 
     // Parallax effect for hero background
     window.addEventListener('scroll', function() {
@@ -151,14 +151,17 @@ function animateTerminal() {
 
 // Typewriter effect
 function typeWriter(element, speed = 100) {
-    const text = element.innerHTML;
+    const originalHTML = element.innerHTML;
+    const textContent = element.textContent || element.innerText;
     element.innerHTML = '';
     element.style.borderRight = '2px solid var(--primary)';
     
     let i = 0;
     function type() {
-        if (i < text.length) {
-            element.innerHTML += text.charAt(i);
+        if (i < textContent.length) {
+            // Reconstruct the HTML with the typed portion
+            const typedText = textContent.substring(0, i + 1);
+            element.innerHTML = originalHTML.replace(textContent, typedText);
             i++;
             setTimeout(type, speed);
         } else {
