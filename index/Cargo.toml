@@ -1,0 +1,18 @@
+[package]
+name = "quantadb-index"
+description = "Persistent immutable B+ tree indexes for QuantaDB"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+quantadb-storage = { path = "../storage" }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
