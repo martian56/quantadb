@@ -82,6 +82,18 @@ impl<V> SharedByteLru<V> {
         }
     }
 
+    /// Drop one entry, for the rare case its page stops being immutable:
+    /// a released page can be reused with new content.
+    pub fn remove(&self, page_id: PageId) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        if let Some(entry) = inner.map.remove(&page_id) {
+            inner.recency.remove(&entry.tick);
+            inner.bytes -= entry.bytes;
+        }
+    }
+
     /// Insert a decoded value, accounting `bytes` against the budget.
     ///
     /// Values larger than the whole budget are not cached at all.
