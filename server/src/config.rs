@@ -10,6 +10,8 @@ const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 5;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
     pub listen_address: SocketAddr,
+    /// Where the PostgreSQL wire protocol listens; None disables it.
+    pub pg_listen_address: Option<SocketAddr>,
     pub data_directory: PathBuf,
     pub max_connections: usize,
     pub max_in_flight_requests: usize,
@@ -22,6 +24,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             listen_address: SocketAddr::from(([127, 0, 0, 1], 54_321)),
+            pg_listen_address: Some(SocketAddr::from(([127, 0, 0, 1], 55_432))),
             data_directory: PathBuf::from("quantadb-data"),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             max_in_flight_requests: DEFAULT_MAX_IN_FLIGHT_REQUESTS,
@@ -43,6 +46,17 @@ impl ServerConfig {
                     "QUANTA_LISTEN_ADDRESS must be an IP socket address: {error}"
                 ))
             })?;
+        }
+        if let Some(value) = read_env("QUANTA_PG_LISTEN_ADDRESS")? {
+            config.pg_listen_address = if value.eq_ignore_ascii_case("off") {
+                None
+            } else {
+                Some(value.parse().map_err(|error| {
+                    ServerError::Configuration(format!(
+                        "QUANTA_PG_LISTEN_ADDRESS must be an IP socket address or \"off\": {error}"
+                    ))
+                })?)
+            };
         }
         if let Some(value) = read_env("QUANTA_DATA_DIR")? {
             config.data_directory = PathBuf::from(value);
