@@ -13,6 +13,9 @@ pub enum TransactionError {
     #[error("write conflict on key {key:?}")]
     WriteConflict { key: Vec<u8> },
 
+    #[error("range conflict under scanned prefix {prefix:?}")]
+    RangeConflict { prefix: Vec<u8> },
+
     #[error("transaction is no longer active")]
     Inactive,
 
