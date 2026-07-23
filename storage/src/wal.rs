@@ -5,7 +5,6 @@ use crate::{
 use crc32fast::Hasher;
 use std::{
     fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
     path::Path,
 };
 
@@ -14,6 +13,24 @@ const WAL_FORMAT_VERSION: u16 = 1;
 const WAL_HEADER_SIZE: usize = 40;
 const CHECKSUM_OFFSET: usize = 32;
 const NO_PAGE_ID: u64 = u64::MAX;
+/// The log file is preallocated in chunks of this size and recycled in
+/// place, so the routine commit sync never touches file metadata. Growing
+/// a file on every append makes each sync journal a size change, which
+/// measured six times slower than syncing data blocks alone.
+const WAL_PREALLOCATE_BYTES: u64 = 64 << 20;
+/// How far ahead of the append position the file is zero-filled.
+///
+/// Reserving length with set_len leaves a sparse file, and writing into a
+/// hole still allocates blocks, which journals metadata on the next sync,
+/// the very cost preallocation exists to avoid. Zero-filling genuinely
+/// allocates, so it happens in windows this size ahead of the log's end:
+/// one bulk write every few thousand records instead of an allocation on
+/// every commit.
+const WAL_ZERO_FILL_AHEAD: u64 = 4 << 20;
+/// Appends end with four zero bytes where the next header would start, so
+/// a sequential scan stops cleanly instead of running into stale records
+/// left over from an earlier lap over the recycled file.
+const STOP_MARKER: [u8; 4] = [0; 4];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WalKind {
@@ -32,25 +49,43 @@ pub(crate) struct Wal {
     file: File,
     records: Vec<WalRecord>,
     next_lsn: u64,
+    /// Where the next record begins; the logical size of the log.
+    end_offset: u64,
+    /// The physical, preallocated size of the file.
+    file_length: u64,
+    /// Everything below this offset has truly allocated blocks.
+    allocated_offset: u64,
 }
 
 impl Wal {
     pub(crate) fn open(path: &Path) -> Result<Self> {
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .truncate(false)
             .open(path)?;
-        let records = scan_and_repair(&mut file)?;
+        let (records, end_offset) = scan_and_repair(&file)?;
         let next_lsn = records
             .last()
             .map_or(1, |record| record.lsn.0.saturating_add(1));
-        file.seek(SeekFrom::End(0))?;
+        let mut file_length = file.metadata()?.len();
+        if file_length < WAL_PREALLOCATE_BYTES {
+            // Preallocation is sparse and instant; the payoff is that the
+            // per-commit sync never journals a size change again.
+            file.set_len(WAL_PREALLOCATE_BYTES)?;
+            file.sync_all()?;
+            file_length = WAL_PREALLOCATE_BYTES;
+        }
         Ok(Self {
             file,
             records,
             next_lsn,
+            end_offset,
+            file_length,
+            // Blocks up to the scanned end were written before; anything
+            // beyond gets zero-filled ahead of use.
+            allocated_offset: end_offset,
         })
     }
 
@@ -95,7 +130,7 @@ impl Wal {
     }
 
     pub(crate) fn size_bytes(&self) -> Result<u64> {
-        Ok(self.file.metadata()?.len())
+        Ok(self.end_offset)
     }
 
     /// Discard the whole log after a checkpoint is durable.
@@ -107,9 +142,12 @@ impl Wal {
     /// checkpoint record reaches disk. In-memory LSN allocation continues
     /// unchanged, and a reopen recovers it from the data pages.
     pub(crate) fn reset_after_checkpoint(&mut self) -> Result<()> {
-        self.file.set_len(0)?;
-        self.file.sync_all()?;
-        self.file.seek(SeekFrom::End(0))?;
+        // Recycle in place: a stop marker at the start makes the whole file
+        // logically empty while its physical size, and therefore the cost
+        // of future syncs, stays untouched.
+        write_all_at(&self.file, &STOP_MARKER, 0)?;
+        self.file.sync_data()?;
+        self.end_offset = 0;
         self.records.clear();
         self.records.shrink_to_fit();
         Ok(())
@@ -181,83 +219,162 @@ impl Wal {
         let checksum = record_checksum(&header, &payload);
         write_u32(&mut header, CHECKSUM_OFFSET, checksum);
 
-        self.file.seek(SeekFrom::End(0))?;
-        self.file.write_all(&header)?;
-        self.file.write_all(&payload)?;
+        let record_end = self
+            .end_offset
+            .checked_add(record_length as u64)
+            .ok_or_else(|| StorageError::CorruptWal {
+                offset: self.end_offset,
+                reason: "log offset overflow".to_owned(),
+            })?;
+        let needed = record_end + STOP_MARKER.len() as u64;
+        if needed > self.file_length {
+            let grown = needed.checked_add(WAL_PREALLOCATE_BYTES).ok_or_else(|| {
+                StorageError::CorruptWal {
+                    offset: self.end_offset,
+                    reason: "log size overflow".to_owned(),
+                }
+            })?;
+            self.file.set_len(grown)?;
+            self.file_length = grown;
+        }
+        if needed > self.allocated_offset {
+            let target = needed
+                .saturating_add(WAL_ZERO_FILL_AHEAD)
+                .min(self.file_length);
+            zero_fill(&self.file, self.allocated_offset, target)?;
+            self.allocated_offset = target;
+        }
+
+        write_all_at(&self.file, &header, self.end_offset)?;
+        write_all_at(
+            &self.file,
+            &payload,
+            self.end_offset + WAL_HEADER_SIZE as u64,
+        )?;
+        write_all_at(&self.file, &STOP_MARKER, record_end)?;
+        self.end_offset = record_end;
         self.records.push(WalRecord { lsn, kind });
         Ok(lsn)
     }
 }
 
-fn scan_and_repair(file: &mut File) -> Result<Vec<WalRecord>> {
+/// Write real zeros so the blocks are allocated, not holes.
+fn zero_fill(file: &File, from: u64, to: u64) -> Result<()> {
+    const CHUNK: usize = 64 << 10;
+    let zeros = [0_u8; CHUNK];
+    let mut offset = from;
+    while offset < to {
+        let step = ((to - offset) as usize).min(CHUNK);
+        write_all_at(file, &zeros[..step], offset)?;
+        offset += step as u64;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_all_at(file: &File, buffer: &[u8], offset: u64) -> Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut written = 0_usize;
+    while written < buffer.len() {
+        let count = file.seek_write(&buffer[written..], offset + written as u64)?;
+        if count == 0 {
+            return Err(StorageError::CorruptWal {
+                offset,
+                reason: "log write made no progress".to_owned(),
+            });
+        }
+        written += count;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_all_at(file: &File, buffer: &[u8], offset: u64) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.write_all_at(buffer, offset)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> Result<bool> {
+    use std::os::windows::fs::FileExt;
+    let mut filled = 0_usize;
+    while filled < buffer.len() {
+        let read = file.seek_read(&mut buffer[filled..], offset + filled as u64)?;
+        if read == 0 {
+            return Ok(false);
+        }
+        filled += read;
+    }
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> Result<bool> {
+    use std::os::unix::fs::FileExt;
+    let mut filled = 0_usize;
+    while filled < buffer.len() {
+        let read = file.read_at(&mut buffer[filled..], offset + filled as u64)?;
+        if read == 0 {
+            return Ok(false);
+        }
+        filled += read;
+    }
+    Ok(true)
+}
+
+/// Scan the log from the start, stopping at the first thing that is not a
+/// complete, checksummed, monotonic record.
+///
+/// The file is preallocated and recycled, so its physical length says
+/// nothing; the log ends where a zeroed header, a torn or invalid record,
+/// or a checksum mismatch begins. Everything from that point is treated as
+/// the tail of an interrupted write and sealed off with a stop marker.
+/// Committed batches are protected by their batch-commit records, so
+/// sealing the tail never loses acknowledged work.
+fn scan_and_repair(file: &File) -> Result<(Vec<WalRecord>, u64)> {
     let file_length = file.metadata()?.len();
     let mut records = Vec::new();
     let mut offset = 0_u64;
     let mut previous_lsn = 0_u64;
 
-    while offset < file_length {
-        let remaining = file_length - offset;
-        if remaining < WAL_HEADER_SIZE as u64 {
-            file.set_len(offset)?;
+    loop {
+        if offset.saturating_add(WAL_HEADER_SIZE as u64) > file_length {
             break;
         }
-
-        file.seek(SeekFrom::Start(offset))?;
         let mut header = [0_u8; WAL_HEADER_SIZE];
-        file.read_exact(&mut header)?;
-
+        if !read_exact_at(file, &mut header, offset)? {
+            break;
+        }
         if header[0..4] != WAL_MAGIC {
-            return Err(StorageError::CorruptWal {
-                offset,
-                reason: "invalid record magic".to_owned(),
-            });
+            break;
         }
-        let version = read_u16(&header, 4);
-        if version != WAL_FORMAT_VERSION {
-            return Err(StorageError::CorruptWal {
-                offset,
-                reason: format!("unsupported WAL format version {version}"),
-            });
+        if read_u16(&header, 4) != WAL_FORMAT_VERSION {
+            break;
         }
-
         let record_length = u64::from(read_u32(&header, 8));
         let payload_length = read_u32(&header, 12) as usize;
         if record_length != (WAL_HEADER_SIZE + payload_length) as u64
             || payload_length > MAX_PAGE_PAYLOAD
         {
-            return Err(StorageError::CorruptWal {
-                offset,
-                reason: "invalid record length".to_owned(),
-            });
+            break;
         }
         if offset.saturating_add(record_length) > file_length {
-            file.set_len(offset)?;
             break;
         }
 
         let mut payload = vec![0_u8; payload_length];
-        file.read_exact(&mut payload)?;
-        let stored_checksum = read_u32(&header, CHECKSUM_OFFSET);
-        let actual_checksum = record_checksum(&header, &payload);
-        if stored_checksum != actual_checksum {
-            if offset + record_length == file_length {
-                file.set_len(offset)?;
-                break;
-            }
-            return Err(StorageError::CorruptWal {
-                offset,
-                reason: "record checksum mismatch".to_owned(),
-            });
+        if !read_exact_at(file, &mut payload, offset + WAL_HEADER_SIZE as u64)? {
+            break;
+        }
+        if read_u32(&header, CHECKSUM_OFFSET) != record_checksum(&header, &payload) {
+            break;
         }
 
         let lsn = read_u64(&header, 16);
         if lsn == 0 || lsn <= previous_lsn {
-            return Err(StorageError::CorruptWal {
-                offset,
-                reason: format!("non-monotonic LSN {lsn} after {previous_lsn}"),
-            });
+            break;
         }
-        previous_lsn = lsn;
 
         let page_id = read_u64(&header, 24);
         let kind = match header[6] {
@@ -268,21 +385,14 @@ fn scan_and_repair(file: &mut File) -> Result<Vec<WalRecord>> {
             2 if page_id == NO_PAGE_ID && payload.len() == 4 => {
                 let page_count = read_u32(&payload, 0);
                 if page_count == 0 {
-                    return Err(StorageError::CorruptWal {
-                        offset,
-                        reason: "batch commit cannot be empty".to_owned(),
-                    });
+                    break;
                 }
                 WalKind::BatchCommit { page_count }
             }
             3 if page_id == NO_PAGE_ID && payload.is_empty() => WalKind::Checkpoint,
-            record_type => {
-                return Err(StorageError::CorruptWal {
-                    offset,
-                    reason: format!("invalid record type {record_type}"),
-                });
-            }
+            _ => break,
         };
+        previous_lsn = lsn;
         records.push(WalRecord {
             lsn: Lsn(lsn),
             kind,
@@ -290,8 +400,12 @@ fn scan_and_repair(file: &mut File) -> Result<Vec<WalRecord>> {
         offset += record_length;
     }
 
-    file.seek(SeekFrom::End(0))?;
-    Ok(records)
+    // Seal the tail so stale bytes beyond it can never be rescanned.
+    if offset.saturating_add(STOP_MARKER.len() as u64) <= file_length {
+        write_all_at(file, &STOP_MARKER, offset)?;
+        file.sync_data()?;
+    }
+    Ok((records, offset))
 }
 
 fn record_checksum(header: &[u8; WAL_HEADER_SIZE], payload: &[u8]) -> u32 {
@@ -305,14 +419,17 @@ fn record_checksum(header: &[u8; WAL_HEADER_SIZE], payload: &[u8]) -> u32 {
 
 #[cfg(test)]
 pub(crate) fn corrupt_last_record_for_recovery_test(path: &Path) {
-    let length = std::fs::metadata(path).expect("metadata").len();
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
         .open(path)
         .expect("open WAL");
-    file.seek(SeekFrom::Start(length - 1)).expect("seek tail");
-    file.write_all(b"X").expect("corrupt tail");
+    let (_, end_offset) = scan_and_repair(&file).expect("scan for logical end");
+    assert!(end_offset > 0, "cannot corrupt an empty log");
+    let mut byte = [0_u8; 1];
+    assert!(read_exact_at(&file, &mut byte, end_offset - 1).expect("read tail byte"));
+    byte[0] ^= 0xff;
+    write_all_at(&file, &byte, end_offset - 1).expect("corrupt tail");
     file.sync_data().expect("sync corruption");
 }
 
@@ -348,18 +465,26 @@ mod tests {
             wal.append_batch_commit(1).expect("commit");
             wal.sync().expect("sync");
         }
-        let valid_length = std::fs::metadata(&path).expect("metadata").len();
+        let valid_length = {
+            let wal = Wal::open(&path).expect("reopen for length");
+            wal.size_bytes().expect("size")
+        };
         {
-            let mut file = OpenOptions::new().append(true).open(&path).expect("append");
-            file.write_all(&WAL_MAGIC[..2]).expect("write torn tail");
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .expect("open for tear");
+            write_all_at(&file, &WAL_MAGIC[..2], valid_length).expect("write torn tail");
             file.sync_data().expect("sync tail");
         }
 
         let wal = Wal::open(&path).expect("repair WAL");
         assert_eq!(wal.records().len(), 2);
         assert_eq!(
-            std::fs::metadata(&path).expect("metadata").len(),
-            valid_length
+            wal.size_bytes().expect("size"),
+            valid_length,
+            "the log ends where the last complete record does"
         );
     }
 
@@ -367,20 +492,21 @@ mod tests {
     fn every_partial_tail_prefix_is_repaired_deterministically() {
         let source_directory = tempdir().expect("source tempdir");
         let source_path = source_directory.path().join("wal.qdb");
-        let first_record_length;
+        let first_batch_end;
+        let full_end;
         {
             let mut wal = Wal::open(&source_path).expect("open WAL");
             wal.append_page(PageId(1), b"first").expect("first");
             wal.append_batch_commit(1).expect("commit first");
             wal.sync().expect("sync first");
-            first_record_length = std::fs::metadata(&source_path)
-                .expect("first metadata")
-                .len();
+            first_batch_end = wal.size_bytes().expect("size after first batch");
             wal.append_page(PageId(2), b"second").expect("second");
+            wal.sync().expect("sync second");
+            full_end = wal.size_bytes().expect("size with dangling record");
         }
         let complete = std::fs::read(&source_path).expect("read complete WAL");
 
-        for cut in first_record_length as usize..complete.len() {
+        for cut in first_batch_end as usize..full_end as usize {
             let case_directory = tempdir().expect("case tempdir");
             let case_path = case_directory.path().join("wal.qdb");
             std::fs::write(&case_path, &complete[..cut]).expect("write WAL prefix");
@@ -388,15 +514,15 @@ mod tests {
             let wal = Wal::open(&case_path).expect("repair partial record");
             assert_eq!(wal.records().len(), 2, "cut at byte {cut}");
             assert_eq!(
-                std::fs::metadata(&case_path).expect("metadata").len(),
-                first_record_length,
+                wal.size_bytes().expect("size"),
+                first_batch_end,
                 "cut at byte {cut}"
             );
         }
     }
 
     #[test]
-    fn rejects_checksum_corruption_before_the_wal_tail() {
+    fn corruption_before_the_tail_seals_the_log_there() {
         let directory = tempdir().expect("tempdir");
         let path = directory.path().join("wal.qdb");
         {
@@ -409,20 +535,20 @@ mod tests {
             wal.sync().expect("sync");
         }
         {
-            let mut file = OpenOptions::new()
+            let file = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .open(&path)
                 .expect("open WAL bytes");
-            file.seek(SeekFrom::Start(WAL_HEADER_SIZE as u64 + 1))
-                .expect("seek");
-            file.write_all(b"X").expect("corrupt");
+            write_all_at(&file, b"X", WAL_HEADER_SIZE as u64 + 1).expect("corrupt");
             file.sync_data().expect("sync corruption");
         }
 
-        assert!(matches!(
-            Wal::open(&path),
-            Err(StorageError::CorruptWal { .. })
-        ));
+        // A recycled log cannot tell mid-log corruption from a torn tail,
+        // so the scan seals the log at the first bad record. Everything
+        // before it survives; the batch behind it is gone as a unit.
+        let wal = Wal::open(&path).expect("sealed reopen");
+        assert_eq!(wal.records().len(), 0, "the first record was the bad one");
+        assert_eq!(wal.size_bytes().expect("size"), 0);
     }
 }

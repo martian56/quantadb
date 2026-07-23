@@ -1,6 +1,6 @@
 use crate::{
-    store::SharedReader, DurableStore, Lsn, Page, PageId, PageWrite, Result, StorageError,
-    MAX_PAGE_PAYLOAD,
+    store::{PageAllocator, SharedReader},
+    DurableStore, Lsn, Page, PageId, PageWrite, Result, StorageError, MAX_PAGE_PAYLOAD,
 };
 use std::{
     sync::{
@@ -38,7 +38,7 @@ impl Default for GroupCommitOptions {
             max_batch_pages: 256,
             max_delay: Duration::from_micros(200),
             checkpoint_after_wal_bytes: 64 << 20,
-            flush_pages_per_batch: 256,
+            flush_pages_per_batch: 32,
         }
     }
 }
@@ -93,6 +93,7 @@ impl AtomicStats {
 
 struct CommitRequest {
     writes: Vec<PageWrite>,
+    durable: bool,
     response: SyncSender<Result<Vec<Lsn>>>,
 }
 
@@ -110,8 +111,8 @@ pub struct GroupCommitter {
 #[derive(Clone)]
 pub struct GroupCommitHandle {
     sender: SyncSender<Command>,
-    store: Arc<Mutex<DurableStore>>,
     reader: Arc<SharedReader>,
+    allocator: Arc<PageAllocator>,
     stats: Arc<AtomicStats>,
 }
 
@@ -119,10 +120,11 @@ impl GroupCommitter {
     pub fn start(store: DurableStore, options: GroupCommitOptions) -> Result<Self> {
         let options = options.validate()?;
         let reader = Arc::new(store.shared_reader()?);
+        let allocator = store.page_allocator();
         let store = Arc::new(Mutex::new(store));
         let stats = Arc::new(AtomicStats::default());
         let (sender, receiver) = mpsc::sync_channel(options.queue_depth);
-        let worker_store = Arc::clone(&store);
+        let worker_store = store;
         let worker_stats = Arc::clone(&stats);
         let worker = thread::Builder::new()
             .name("quantadb-group-commit".to_owned())
@@ -131,8 +133,8 @@ impl GroupCommitter {
         Ok(Self {
             handle: GroupCommitHandle {
                 sender,
-                store,
                 reader,
+                allocator,
                 stats,
             },
             worker: Some(worker),
@@ -175,6 +177,20 @@ impl Drop for GroupCommitter {
 
 impl GroupCommitHandle {
     pub fn commit(&self, writes: Vec<PageWrite>) -> Result<Vec<Lsn>> {
+        self.commit_with(writes, true)
+    }
+
+    /// Commit a batch that rides the next sync instead of forcing one.
+    ///
+    /// The pages become visible to readers immediately and durable when
+    /// any later synced batch or checkpoint lands. A crash before then
+    /// loses the whole batch atomically, so this lane is only for work
+    /// the caller can rebuild, like index generations.
+    pub fn commit_relaxed(&self, writes: Vec<PageWrite>) -> Result<Vec<Lsn>> {
+        self.commit_with(writes, false)
+    }
+
+    fn commit_with(&self, writes: Vec<PageWrite>, durable: bool) -> Result<Vec<Lsn>> {
         if writes.is_empty() {
             return Ok(Vec::new());
         }
@@ -191,6 +207,7 @@ impl GroupCommitHandle {
         self.sender
             .send(Command::Commit(CommitRequest {
                 writes,
+                durable,
                 response: sender,
             }))
             .map_err(|_| StorageError::CommitCoordinatorStopped)?;
@@ -208,28 +225,22 @@ impl GroupCommitHandle {
         self.reader.read_page(page_id)
     }
 
+    /// Reserve page IDs without touching the store mutex.
+    ///
+    /// Committers call this while another batch may be mid-sync; going
+    /// through the shared allocator keeps them preparing their own batch
+    /// instead of standing in line behind someone else's fsync.
     pub fn reserve_page_ids(&self, count: usize) -> Result<Vec<PageId>> {
-        self.store
-            .lock()
-            .map_err(|_| StorageError::GroupCommit("store mutex is poisoned".to_owned()))?
-            .reserve_page_ids(count)
+        self.allocator.reserve(count)
     }
 
-    /// Return unreachable pages to the store's free pool.
+    /// Return unreachable pages to the free pool.
     pub fn release_pages(&self, pages: impl IntoIterator<Item = PageId>) -> Result<()> {
-        self.store
-            .lock()
-            .map_err(|_| StorageError::GroupCommit("store mutex is poisoned".to_owned()))?
-            .release_pages(pages);
-        Ok(())
+        self.allocator.release(pages)
     }
 
     pub fn free_page_count(&self) -> Result<usize> {
-        Ok(self
-            .store
-            .lock()
-            .map_err(|_| StorageError::GroupCommit("store mutex is poisoned".to_owned()))?
-            .free_page_count())
+        self.allocator.free_page_count()
     }
 
     pub fn checkpoint(&self) -> Result<Lsn> {
@@ -360,10 +371,11 @@ fn execute_group(store: &Mutex<DurableStore>, stats: &AtomicStats, requests: Vec
         .flat_map(|request| request.writes.iter().cloned())
         .collect::<Vec<_>>();
 
+    let durable = requests.iter().any(|request| request.durable);
     let result = store
         .lock()
         .map_err(|_| StorageError::GroupCommit("store mutex is poisoned".to_owned()))
-        .and_then(|mut store| store.write_pages(writes));
+        .and_then(|mut store| store.write_pages_with(writes, durable));
 
     stats.groups.fetch_add(1, Ordering::Relaxed);
     stats
