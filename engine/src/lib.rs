@@ -12,7 +12,7 @@ mod result;
 mod schema;
 mod value;
 
-pub use database::{DatabaseEngine, SqlSession};
+pub use database::{DatabaseEngine, SessionStatus, SqlSession};
 pub use error::{EngineError, Result};
 pub use result::{OutputColumn, StatementOutput, TransactionOutput};
 pub use schema::{ColumnSchema, LogicalType, TableSchema};

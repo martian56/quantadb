@@ -30,6 +30,14 @@ enum SessionState {
     Failed,
 }
 
+/// The transaction position of a session, for protocol status reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStatus {
+    Idle,
+    InTransaction,
+    Failed,
+}
+
 impl DatabaseEngine {
     pub fn open(path: impl AsRef<Path>, options: MvccOptions) -> Result<Self> {
         Ok(Self {
@@ -47,6 +55,15 @@ impl DatabaseEngine {
 }
 
 impl SqlSession {
+    #[must_use]
+    pub fn transaction_status(&self) -> SessionStatus {
+        match self.state {
+            SessionState::Idle => SessionStatus::Idle,
+            SessionState::Active(_) => SessionStatus::InTransaction,
+            SessionState::Failed => SessionStatus::Failed,
+        }
+    }
+
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementOutput>> {
         let statements = match parse_sql(sql) {
             Ok(statements) => statements,
