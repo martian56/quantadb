@@ -23,6 +23,12 @@ pub struct GroupCommitOptions {
     /// still work. The check runs after each committed batch, so the log
     /// can overshoot by at most one batch.
     pub checkpoint_after_wal_bytes: u64,
+    /// Dirty pages written to the data file, unsynced, after each batch.
+    ///
+    /// This paces checkpoint work into small slices between commits so the
+    /// checkpoint itself mostly syncs instead of bursting. Zero disables
+    /// pacing and checkpoints do all the writing themselves.
+    pub flush_pages_per_batch: usize,
 }
 
 impl Default for GroupCommitOptions {
@@ -32,6 +38,7 @@ impl Default for GroupCommitOptions {
             max_batch_pages: 256,
             max_delay: Duration::from_micros(200),
             checkpoint_after_wal_bytes: 64 << 20,
+            flush_pages_per_batch: 256,
         }
     }
 }
@@ -281,6 +288,7 @@ fn commit_worker(
                     }
                 }
                 execute_group(&store, &stats, requests);
+                pace_flush(&store, &options);
                 maybe_checkpoint(&store, &stats, &options);
             }
             Command::Checkpoint(response) => {
@@ -304,6 +312,16 @@ fn commit_worker(
 /// checkpoint that its own batch triggered. A failed checkpoint poisons the
 /// store, which makes the next commit fail loudly instead of silently
 /// running with an unbounded log.
+/// Write a slice of dirty pages into the page cache between batches.
+fn pace_flush(store: &Mutex<DurableStore>, options: &GroupCommitOptions) {
+    if options.flush_pages_per_batch == 0 {
+        return;
+    }
+    if let Ok(mut store) = store.lock() {
+        let _ = store.flush_some_dirty(options.flush_pages_per_batch);
+    }
+}
+
 fn maybe_checkpoint(
     store: &Mutex<DurableStore>,
     stats: &AtomicStats,

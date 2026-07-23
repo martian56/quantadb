@@ -88,6 +88,12 @@ pub struct DurableStore {
     data: DataFile,
     wal: Wal,
     dirty: std::sync::Arc<DirtyPages>,
+    /// Dirty pages already written to the data file, by the LSN written.
+    ///
+    /// Written is not durable: these still need the data sync a checkpoint
+    /// performs, so they stay in the dirty table too. Tracking the LSN
+    /// catches pages overwritten by a newer commit after their flush.
+    flushed: std::collections::HashMap<PageId, Lsn>,
     next_page_id: u64,
     /// Released page IDs waiting for reuse.
     ///
@@ -130,6 +136,7 @@ impl DurableStore {
             dirty: std::sync::Arc::new(DirtyPages {
                 pages: std::sync::RwLock::new(std::collections::HashMap::new()),
             }),
+            flushed: std::collections::HashMap::new(),
             next_page_id: 0,
             free_pages: std::collections::BTreeSet::new(),
             poisoned: false,
@@ -299,22 +306,45 @@ impl DurableStore {
         Ok(lsns)
     }
 
-    fn checkpoint_inner(&mut self) -> Result<Lsn> {
-        // Flush and sync every dirty page before the log that protects them
-        // shrinks. Entries leave the table only after the sync, so a reader
-        // always finds each page in the table or, once removed, in the
-        // synced file; there is no torn-read window in between.
-        let flushed: Vec<Page> = {
+    /// Write up to `budget` dirty pages to the data file without syncing.
+    ///
+    /// This paces the checkpoint's work across quiet moments: writes land
+    /// in the operating system's cache in small slices, so the eventual
+    /// checkpoint mostly just syncs instead of bursting megabytes while
+    /// commits wait. Pages stay in the dirty table because they are not
+    /// durable in the data file until that sync.
+    pub fn flush_some_dirty(&mut self, budget: usize) -> Result<usize> {
+        let pending: Vec<Page> = {
             let dirty = self
                 .dirty
                 .pages
                 .read()
                 .map_err(|_| StorageError::Poisoned)?;
-            dirty.values().cloned().collect()
+            dirty
+                .values()
+                .filter(|page| {
+                    self.flushed
+                        .get(&page.id())
+                        .is_none_or(|written| *written != page.lsn())
+                })
+                .take(budget)
+                .cloned()
+                .collect()
         };
-        for page in &flushed {
+        for page in &pending {
             self.data.write(page)?;
+            self.flushed.insert(page.id(), page.lsn());
         }
+        Ok(pending.len())
+    }
+
+    fn checkpoint_inner(&mut self) -> Result<Lsn> {
+        // Finish writing whatever the incremental flusher has not covered,
+        // sync, and only then shrink the log that protects these pages.
+        // Entries leave the dirty table only after the sync, so a reader
+        // always finds each page in the table or, once removed, in the
+        // synced file; there is no torn-read window in between.
+        while self.flush_some_dirty(usize::MAX)? > 0 {}
         self.data.sync()?;
 
         let lsn = self.wal.append_checkpoint()?;
@@ -326,14 +356,12 @@ impl DurableStore {
             .pages
             .write()
             .map_err(|_| StorageError::Poisoned)?;
-        for page in &flushed {
-            if dirty
-                .get(&page.id())
-                .is_some_and(|current| current.lsn() == page.lsn())
-            {
-                dirty.remove(&page.id());
-            }
-        }
+        dirty.retain(|page_id, page| {
+            self.flushed
+                .get(page_id)
+                .is_none_or(|written| *written != page.lsn())
+        });
+        self.flushed.clear();
         Ok(lsn)
     }
 
