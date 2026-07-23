@@ -1,485 +1,293 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>QuantaDB - The Future of Database Management</title>
-    <link rel="icon" href="favicon.ico" type="image/x-icon">
-    <meta name="description" content="QuantaDB is a modern, high-performance database management system built with Rust, featuring a custom SQL dialect and multiple client interfaces.">
-    <link rel="stylesheet" href="style.css">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QuantaDB</title>
+<meta name="description" content="QuantaDB is an experimental OLTP database in Rust: checksummed pages, a physical write-ahead log, MVCC snapshots, and benchmarks published with the hardware they ran on.">
+<link rel="icon" href="favicon.ico">
+<link rel="stylesheet" href="style.css">
 </head>
 <body>
-    <!-- Navigation -->
-    <nav class="navbar">
-        <div class="nav-container">
-            <div class="nav-logo">
-                <i class="fas fa-database"></i>
-                <span>QuantaDB</span>
-            </div>
-            <div class="nav-menu">
-                <a href="#features" class="nav-link">Features</a>
-                <a href="#architecture" class="nav-link">Architecture</a>
-                <a href="#roadmap" class="nav-link">Roadmap</a>
-                <a href="#demo" class="nav-link">Demo</a>
-                <a href="#contact" class="nav-link">Contact</a>
-            </div>
-            <div class="nav-toggle">
-                <span></span>
-                <span></span>
-                <span></span>
-            </div>
-        </div>
+
+<header class="masthead">
+  <div class="masthead-inner">
+    <a class="wordmark" href="#top">QuantaDB</a>
+    <span class="version">v0.2.0, experimental</span>
+    <nav class="masthead-nav">
+      <a href="#formats">Formats</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#measured">Numbers</a>
+      <a href="#protocol">Protocol</a>
+      <a href="#status">Status</a>
+      <a class="repo-link" href="https://github.com/martian56/quantadb">Source</a>
     </nav>
+  </div>
+</header>
 
-    <!-- Hero Section -->
-    <section class="hero">
-        <div class="hero-background">
-            <div class="floating-shapes">
-                <div class="shape shape-1"></div>
-                <div class="shape shape-2"></div>
-                <div class="shape shape-3"></div>
-                <div class="shape shape-4"></div>
-            </div>
-        </div>
-        <div class="container">
-            <div class="hero-content">
-                <div class="hero-text">
-                    <h1 class="hero-title">
-                        <span class="gradient-text">QuantaDB</span>
-                        <br>The Future of Database Management
-                    </h1>
-                    <p class="hero-description">
-                        A modern, high-performance database management system built with Rust, 
-                        featuring a custom SQL dialect, file-based persistence, and multiple client interfaces.
-                    </p>
-                    <div class="hero-buttons">
-                        <a href="https://github.com/martian56/quantadb" class="btn btn-primary" target="_blank">
-                            <i class="fab fa-github"></i>
-                            View on GitHub
-                        </a>
-                        <a href="#demo" class="btn btn-secondary">
-                            <i class="fas fa-play"></i>
-                            See Demo
-                        </a>
-                    </div>
-                </div>
-                <div class="hero-visual">
-                <div class="code-window">
-                    <div class="window-header">
-                        <div class="window-controls">
-                            <span class="control red"></span>
-                            <span class="control yellow"></span>
-                            <span class="control green"></span>
-                        </div>
-                        <div class="window-title">quanta-cli</div>
-                    </div>
-                    <div class="code-content">
-                        <div class="code-line">
-                            <span class="prompt">quanta=> </span>
-                            <span class="code">CREATE TABLE users (id INT, name TEXT, age INT);</span>
-                        </div>
-                        <div class="code-line success">
-                            <span class="output">✅ Table 'users' created successfully</span>
-                        </div>
-                        <div class="code-line">
-                            <span class="prompt">quanta=> </span>
-                            <span class="code">INSERT INTO users VALUES (1, "Alice", 25);</span>
-                        </div>
-                        <div class="code-line success">
-                            <span class="output">✅ Row inserted with ID: 1</span>
-                        </div>
-                        <div class="code-line">
-                            <span class="prompt">quanta=> </span>
-                            <span class="code">SELECT * FROM users;</span>
-                        </div>
-                        <div class="code-line">
-                            <span class="output">┌────┬───────┬─────┐</span>
-                        </div>
-                        <div class="code-line">
-                            <span class="output">│ id │ name  │ age │</span>
-                        </div>
-                        <div class="code-line">
-                            <span class="output">├────┼───────┼─────┤</span>
-                        </div>
-                        <div class="code-line">
-                            <span class="output">│ 1  │ Alice │ 25  │</span>
-                        </div>
-                        <div class="code-line">
-                            <span class="output">└────┴───────┴─────┘</span>
-                        </div>
-                    </div>
-                </div>
-                </div>
-            </div>
-        </div>
-        </div>
-    </section>
+<main id="top">
 
-    <!-- Features Section -->
-    <section id="features" class="features">
-        <div class="container">
-            <div class="section-header">
-                <h2 class="section-title">Why QuantaDB?</h2>
-                <p class="section-description">
-                    Built for performance, designed for simplicity, engineered for the future.
-                </p>
-            </div>
-            <div class="features-grid">
-                <div class="feature-card" data-aos="fade-up" data-aos-delay="100">
-                    <div class="feature-icon">
-                        <i class="fas fa-bolt"></i>
-                    </div>
-                    <h3>Lightning Fast</h3>
-                    <p>Built with Rust for maximum performance and memory safety. In-memory operations with optional file-based persistence.</p>
-                </div>
-                <div class="feature-card" data-aos="fade-up" data-aos-delay="200">
-                    <div class="feature-icon">
-                        <i class="fas fa-language"></i>
-                    </div>
-                    <h3>QuantaSQL</h3>
-                    <p>Custom SQL dialect designed for simplicity and clarity. Essential operations without the complexity of traditional SQL.</p>
-                </div>
-                <div class="feature-card" data-aos="fade-up" data-aos-delay="300">
-                    <div class="feature-icon">
-                        <i class="fas fa-plug"></i>
-                    </div>
-                    <h3>Multiple Clients</h3>
-                    <p>CLI client, Python connector, Rust library, and desktop application. Choose the interface that fits your workflow.</p>
-                </div>
-                <div class="feature-card" data-aos="fade-up" data-aos-delay="400">
-                    <div class="feature-icon">
-                        <i class="fas fa-shield-alt"></i>
-                    </div>
-                    <h3>Memory Safe</h3>
-                    <p>Rust's ownership model eliminates entire classes of bugs. No segfaults, no data races, no memory leaks.</p>
-                </div>
-                <div class="feature-card" data-aos="fade-up" data-aos-delay="500">
-                    <div class="feature-icon">
-                        <i class="fas fa-save"></i>
-                    </div>
-                    <h3>Persistent Storage</h3>
-                    <p>File-based persistence with JSON serialization. Your data survives server restarts and system reboots.</p>
-                </div>
-                <div class="feature-card" data-aos="fade-up" data-aos-delay="600">
-                    <div class="feature-icon">
-                        <i class="fas fa-expand-arrows-alt"></i>
-                    </div>
-                    <h3>Scalable Architecture</h3>
-                    <p>Modular design with async networking. Ready for clustering, replication, and distributed deployments.</p>
-                </div>
-            </div>
-        </div>
-    </section>
+<section class="hero">
+  <div class="hero-copy">
+    <p class="eyebrow">A durable OLTP engine, written in Rust</p>
+    <h1>A database that shows its work.</h1>
+    <p class="lede">
+      Every page is checksummed. Every commit waits for the log. Every
+      benchmark names the machine it ran on, and a result is thrown out if a
+      single correctness test fails. QuantaDB is being built the slow way:
+      storage first, proofs before promises.
+    </p>
+    <div class="hero-actions">
+      <a class="button" href="https://github.com/martian56/quantadb">Read the source</a>
+      <a class="button quiet" href="https://github.com/martian56/quantadb/tree/main/docs">Read the formats</a>
+    </div>
+  </div>
 
-    <!-- Architecture Section -->
-    <section id="architecture" class="architecture">
-        <div class="container">
-            <div class="section-header">
-                <h2 class="section-title">Architecture</h2>
-                <p class="section-description">
-                    A modern, modular design built for performance and extensibility.
-                </p>
-            </div>
-            <div class="architecture-diagram">
-                <div class="arch-layer">
-                    <div class="arch-title">Client Layer</div>
-                    <div class="arch-components">
-                        <div class="arch-component">CLI Client</div>
-                        <div class="arch-component">Python Connector</div>
-                        <div class="arch-component">Rust Library</div>
-                        <div class="arch-component">Desktop App</div>
-                    </div>
-                </div>
-                <div class="arch-arrow">↓</div>
-                <div class="arch-layer">
-                    <div class="arch-title">Network Layer</div>
-                    <div class="arch-components">
-                        <div class="arch-component">TCP Server</div>
-                        <div class="arch-component">Quanta Protocol</div>
-                        <div class="arch-component">Async I/O</div>
-                    </div>
-                </div>
-                <div class="arch-arrow">↓</div>
-                <div class="arch-layer">
-                    <div class="arch-title">Query Engine</div>
-                    <div class="arch-components">
-                        <div class="arch-component">SQL Parser</div>
-                        <div class="arch-component">AST</div>
-                        <div class="arch-component">Query Executor</div>
-                    </div>
-                </div>
-                <div class="arch-arrow">↓</div>
-                <div class="arch-layer">
-                    <div class="arch-title">Storage Engine</div>
-                    <div class="arch-components">
-                        <div class="arch-component">In-Memory Tables</div>
-                        <div class="arch-component">File Persistence</div>
-                        <div class="arch-component">Row Management</div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </section>
+  <figure class="page-artifact" aria-label="Annotated dump of a QuantaDB data page">
+    <figcaption>
+      <span class="mono-label">data page 42, byte for byte</span>
+    </figcaption>
+    <div class="hexdump" id="hexdump">
+      <div class="hexrow">
+        <span class="offset">0000</span>
+        <span class="bytes">51 4E 50 47</span>
+        <span class="note"><i class="line sp-storage"></i>magic "QNPG": this is a page</span>
+      </div>
+      <div class="hexrow">
+        <span class="offset">0004</span>
+        <span class="bytes">01 00&nbsp;&nbsp;00 00</span>
+        <span class="note">format v1, reserved</span>
+      </div>
+      <div class="hexrow">
+        <span class="offset">0008</span>
+        <span class="bytes">2A 00 00 00 00 00 00 00</span>
+        <span class="note">page ID 42, little endian</span>
+      </div>
+      <div class="hexrow">
+        <span class="offset">0010</span>
+        <span class="bytes">C4 01 00 00 00 00 00 00</span>
+        <span class="note">last applied log sequence number</span>
+      </div>
+      <div class="hexrow">
+        <span class="offset">0018</span>
+        <span class="bytes">9A 00 00 00</span>
+        <span class="note">payload length, 154 bytes</span>
+      </div>
+      <div class="hexrow">
+        <span class="offset">001C</span>
+        <span class="bytes">7B 3D 91 C8</span>
+        <span class="note">CRC32 over the whole page</span>
+      </div>
+      <div class="hexrow dim">
+        <span class="offset">0020</span>
+        <span class="bytes">00 00 00 00 &hellip;</span>
+        <span class="note">32 reserved bytes</span>
+      </div>
+      <div class="hexrow">
+        <span class="offset">0040</span>
+        <span class="bytes">51 4E 4D 56 01 00 00 00</span>
+        <span class="note"><i class="line sp-mvcc"></i>payload: an MVCC version record, "QNMV"</span>
+      </div>
+      <div class="hexrow">
+        <span class="offset">0048</span>
+        <span class="bytes">1D 00 00 00 00 00 00 00</span>
+        <span class="note">committed at timestamp 29</span>
+      </div>
+      <div class="hexrow dim">
+        <span class="offset">0050</span>
+        <span class="bytes">&hellip;</span>
+        <span class="note">key, value, zero padding to 8192</span>
+      </div>
+    </div>
+    <p class="artifact-footnote">
+      A page is never written before its log record and batch commit are on
+      disk. Recovery replays complete batches only, so a crash exposes all of
+      a commit or none of it.
+    </p>
+  </figure>
+</section>
 
-    <!-- Current State Section -->
-    <section class="current-state">
-        <div class="container">
-            <div class="section-header">
-                <h2 class="section-title">Current State</h2>
-                <p class="section-description">
-                    What's working today in QuantaDB v0.1.0
-                </p>
-            </div>
-            <div class="state-grid">
-                <div class="state-column">
-                    <h3>✅ Implemented</h3>
-                    <ul class="state-list">
-                        <li><i class="fas fa-check"></i> Custom SQL Parser (QuantaSQL)</li>
-                        <li><i class="fas fa-check"></i> In-Memory Storage Engine</li>
-                        <li><i class="fas fa-check"></i> File-Based Persistence</li>
-                        <li><i class="fas fa-check"></i> TCP Server with Async I/O</li>
-                        <li><i class="fas fa-check"></i> CLI Client (psql-like)</li>
-                        <li><i class="fas fa-check"></i> Python Connector (PyO3)</li>
-                        <li><i class="fas fa-check"></i> Rust Client Library</li>
-                        <li><i class="fas fa-check"></i> Desktop Client (Tauri)</li>
-                        <li><i class="fas fa-check"></i> Basic CRUD Operations</li>
-                        <li><i class="fas fa-check"></i> WHERE Clause Filtering</li>
-                        <li><i class="fas fa-check"></i> Type System with Validation</li>
-                        <li><i class="fas fa-check"></i> Graceful Shutdown</li>
-                    </ul>
-                </div>
-                <div class="state-column">
-                    <h3>🚧 In Progress</h3>
-                    <ul class="state-list">
-                        <li><i class="fas fa-tools"></i> Performance Optimization</li>
-                        <li><i class="fas fa-tools"></i> Error Handling Improvements</li>
-                        <li><i class="fas fa-tools"></i> Documentation</li>
-                        <li><i class="fas fa-tools"></i> Test Coverage</li>
-                    </ul>
-                </div>
-            </div>
-        </div>
-    </section>
+<section class="band" id="formats">
+  <header class="band-head">
+    <p class="eyebrow">On disk</p>
+    <h2>Five magics, one rule: versioned, checksummed, documented.</h2>
+    <p class="band-lede">
+      Everything QuantaDB persists starts with four bytes that say what it is
+      and a version that says how to read it. Readers verify before trusting.
+      The formats are documented in the repository down to the byte, because a
+      storage engine you cannot audit is a storage engine you cannot trust.
+    </p>
+  </header>
+  <ul class="spectrum" role="list">
+    <li><i class="line sp-storage"></i><code>QNPG</code><span class="spectrum-what">data page</span><span class="spectrum-note">8192 bytes, CRC32, identity checked on every read</span></li>
+    <li><i class="line sp-wal"></i><code>QNWL</code><span class="spectrum-what">log record</span><span class="spectrum-note">physical page image, batch commit, or checkpoint</span></li>
+    <li><i class="line sp-mvcc"></i><code>QNMV</code><span class="spectrum-what">version record</span><span class="spectrum-note">key, optional value, commit timestamp</span></li>
+    <li><i class="line sp-index"></i><code>QNIX</code><span class="spectrum-what">index node</span><span class="spectrum-note">immutable B+ tree leaf or internal node</span></li>
+    <li><i class="line sp-engine"></i><code>QNIR</code><span class="spectrum-what">index root</span><span class="spectrum-note">48 byte manifest publishing one generation</span></li>
+  </ul>
+</section>
 
-    <!-- Roadmap Section -->
-    <section id="roadmap" class="roadmap">
-        <div class="container">
-            <div class="section-header">
-                <h2 class="section-title">Roadmap</h2>
-                <p class="section-description">
-                    The future of QuantaDB - where we're heading
-                </p>
-            </div>
-            <div class="roadmap-timeline">
-                <div class="timeline-item" data-aos="fade-right">
-                    <div class="timeline-marker v1"></div>
-                    <div class="timeline-content">
-                        <h3>v0.2.0 - Enhanced Features</h3>
-                        <ul>
-                            <li>UPDATE statements</li>
-                            <li>JOIN operations</li>
-                            <li>Aggregate functions (COUNT, SUM, AVG)</li>
-                            <li>Indexes for faster queries</li>
-                            <li>Transaction support</li>
-                        </ul>
-                    </div>
-                </div>
-                <div class="timeline-item" data-aos="fade-left">
-                    <div class="timeline-marker v2"></div>
-                    <div class="timeline-content">
-                        <h3>v0.3.0 - Advanced Storage</h3>
-                        <ul>
-                            <li>B+ Tree storage engine</li>
-                            <li>WAL (Write-Ahead Logging)</li>
-                            <li>ACID transactions</li>
-                            <li>Concurrent access control</li>
-                            <li>Backup and recovery</li>
-                        </ul>
-                    </div>
-                </div>
-                <div class="timeline-item" data-aos="fade-right">
-                    <div class="timeline-marker v3"></div>
-                    <div class="timeline-content">
-                        <h3>v0.4.0 - Distributed</h3>
-                        <ul>
-                            <li>Network clustering</li>
-                            <li>Data replication</li>
-                            <li>Load balancing</li>
-                            <li>Consensus algorithms</li>
-                            <li>Horizontal scaling</li>
-                        </ul>
-                    </div>
-                </div>
-                <div class="timeline-item" data-aos="fade-left">
-                    <div class="timeline-marker v4"></div>
-                    <div class="timeline-content">
-                        <h3>v1.0.0 - Production Ready</h3>
-                        <ul>
-                            <li>Query optimization</li>
-                            <li>Advanced indexing strategies</li>
-                            <li>Monitoring and metrics</li>
-                            <li>Security features</li>
-                            <li>Production deployment tools</li>
-                        </ul>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </section>
+<section class="band" id="architecture">
+  <header class="band-head">
+    <p class="eyebrow">Architecture</p>
+    <h2>Six crates, one direction.</h2>
+    <p class="band-lede">
+      The dependency graph is acyclic and enforced: parsing knows nothing of
+      storage, the server delegates everything to the engine, and the network
+      threads never touch a disk. Each layer is testable, and tested, alone.
+    </p>
+  </header>
+  <ul class="stack" role="list">
+    <li>
+      <i class="line sp-neutral"></i>
+      <div><h3><code>syntax</code></h3>
+      <p>A dependency-light SQL lexer and parser. Every token carries a byte
+      span, so an error can point at the exact character that caused it.</p></div>
+    </li>
+    <li>
+      <i class="line sp-storage"></i>
+      <div><h3><code>storage</code></h3>
+      <p>Checksummed pages, a physical write-ahead log, restart recovery, and
+      a group commit coordinator that lets concurrent writers share syncs.</p></div>
+    </li>
+    <li>
+      <i class="line sp-index"></i>
+      <div><h3><code>index</code></h3>
+      <p>Immutable B+ tree generations. Readers traverse without locks while
+      the next generation is built beside them, never on top of them.</p></div>
+    </li>
+    <li>
+      <i class="line sp-mvcc"></i>
+      <div><h3><code>mvcc</code></h3>
+      <p>Snapshot isolation with first-committer-wins conflicts. Versions
+      become visible only after the log says they are durable. Old versions
+      are reclaimed the moment no snapshot can see them.</p></div>
+    </li>
+    <li>
+      <i class="line sp-engine"></i>
+      <div><h3><code>engine</code></h3>
+      <p>The relational layer: schemas, constraints, typed expressions, and
+      transactional CRUD mapped onto ordered binary keys.</p></div>
+    </li>
+    <li>
+      <i class="line sp-server"></i>
+      <div><h3><code>server</code></h3>
+      <p>A TCP server bounded on every axis: connections, in-flight requests,
+      frame size, idle time. Overload gets a clean error, not a hung socket.</p></div>
+    </li>
+  </ul>
+</section>
 
-    <!-- Demo Section -->
-    <section id="demo" class="demo">
-        <div class="container">
-            <div class="section-header">
-                <h2 class="section-title">Try QuantaDB</h2>
-                <p class="section-description">
-                    Experience the power of QuantaDB with our interactive demo
-                </p>
-            </div>
-            <div class="demo-container">
-                <div class="demo-terminal">
-                    <div class="terminal-header">
-                        <div class="terminal-controls">
-                            <span class="control red"></span>
-                            <span class="control yellow"></span>
-                            <span class="control green"></span>
-                        </div>
-                        <div class="terminal-title">QuantaDB CLI Demo</div>
-                    </div>
-                    <div class="terminal-content" id="terminal-content">
-                        <div class="terminal-line">
-                            <span class="prompt">$ </span>
-                            <span class="command">cargo run --bin quanta-server</span>
-                        </div>
-                        <div class="terminal-line output">
-                            🚀 Starting QuantaDB Server...
-                            📡 QuantaDB server listening on 127.0.0.1:54321
-                            🔗 Ready to accept connections
-                        </div>
-                        <div class="terminal-line">
-                            <span class="prompt">$ </span>
-                            <span class="command">quanta-cli</span>
-                        </div>
-                        <div class="terminal-line output">
-                            🚀 QuantaDB CLI Client
-                            Connecting to 127.0.0.1:54321...
-                            ✅ Connected to QuantaDB server!
-                        </div>
-                        <div class="terminal-line">
-                            <span class="prompt">quanta=> </span>
-                            <span class="command">CREATE TABLE products (id INT, name TEXT, price FLOAT);</span>
-                        </div>
-                        <div class="terminal-line success">
-                            ✅ Table 'products' created successfully
-                        </div>
-                        <div class="terminal-line">
-                            <span class="prompt">quanta=> </span>
-                            <span class="command">INSERT INTO products VALUES (1, "Laptop", 999.99);</span>
-                        </div>
-                        <div class="terminal-line success">
-                            ✅ Row inserted with ID: 1
-                        </div>
-                        <div class="terminal-line">
-                            <span class="prompt">quanta=> </span>
-                            <span class="command">SELECT * FROM products;</span>
-                        </div>
-                        <div class="terminal-line">
-                            <span class="output">┌────┬────────┬────────┐</span>
-                        </div>
-                        <div class="terminal-line">
-                            <span class="output">│ id │ name   │ price  │</span>
-                        </div>
-                        <div class="terminal-line">
-                            <span class="output">├────┼────────┼────────┤</span>
-                        </div>
-                        <div class="terminal-line">
-                            <span class="output">│ 1  │ Laptop │ 999.99 │</span>
-                        </div>
-                        <div class="terminal-line">
-                            <span class="output">└────┴────────┴────────┘</span>
-                        </div>
-                        <div class="terminal-line">
-                            <span class="output">(1 rows)</span>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </section>
+<section class="band" id="measured">
+  <header class="band-head">
+    <p class="eyebrow">Measured, not promised</p>
+    <h2>The benchmark log is part of the changelog.</h2>
+    <p class="band-lede">
+      These are medians from the development machine: a Core i5-1035G1 laptop
+      with a consumer NVMe drive, full sync on every commit. Not a marketing
+      rig. When a change regresses a number, the number gets published anyway
+      and the regression gets fixed next.
+    </p>
+  </header>
+  <div class="figures">
+    <table class="figures-table">
+      <caption class="mono-label">criterion medians, 2026-07-23</caption>
+      <tbody>
+        <tr><th scope="row">hot indexed point lookup</th><td>705 ns</td></tr>
+        <tr><th scope="row">in-memory snapshot read</th><td>583 ns</td></tr>
+        <tr><th scope="row">parse a point select</th><td>2.8 &micro;s</td></tr>
+        <tr><th scope="row">B+ tree range scan, 100 keys</th><td>13.3 &micro;s</td></tr>
+        <tr><th scope="row">durable single-key commit</th><td>16.1 ms, the disk's fsync</td></tr>
+      </tbody>
+    </table>
+    <div class="figures-story">
+      <p class="mono-label">one workload, one week</p>
+      <p class="story-number"><span>736</span> to <span>2607</span> ops/s</p>
+      <p>
+        The same mixed workload, before and after a node cache, online index
+        publication, version reclamation, and a record cache. The read tail
+        fell from 139 ms worst case to 18.5 ms. One intermediate change made
+        reads worse; the benchmark caught it before main did.
+      </p>
+    </div>
+  </div>
+</section>
 
-    <!-- Contact Section -->
-    <section id="contact" class="contact">
-        <div class="container">
-            <div class="section-header">
-                <h2 class="section-title">Get Involved</h2>
-                <p class="section-description">
-                    Join the QuantaDB community and help shape the future of database management
-                </p>
-            </div>
-            <div class="contact-content">
-                <div class="contact-info">
-                    <div class="contact-card">
-                        <div class="contact-icon">
-                            <i class="fab fa-github"></i>
-                        </div>
-                        <h3>GitHub</h3>
-                        <p>Star the project, report issues, and contribute to the codebase</p>
-                        <a href="https://github.com/martian56/quantadb" class="contact-link" target="_blank">
-                            github.com/martian56/quantadb
-                        </a>
-                    </div>
-                    <div class="contact-card">
-                        <div class="contact-icon">
-                            <i class="fab fa-linkedin"></i>
-                        </div>
-                        <h3>LinkedIn</h3>
-                        <p>Connect with the developer and stay updated on project progress</p>
-                        <a href="https://linkedin.com/in/martian58" class="contact-link" target="_blank">
-                            linkedin.com/in/martian58
-                        </a>
-                    </div>
-                    <div class="contact-card">
-                        <div class="contact-icon">
-                            <i class="fas fa-envelope"></i>
-                        </div>
-                        <h3>Email</h3>
-                        <p>Get in touch for collaboration, questions, or feedback</p>
-                        <a href="mailto:fuadelizade469@gmail.com" class="contact-link">
-                            fuadelizade469@gmail.com
-                        </a>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </section>
+<section class="band" id="protocol">
+  <header class="band-head">
+    <p class="eyebrow">Protocol v1</p>
+    <h2>One JSON frame per line. Deliberately boring.</h2>
+    <p class="band-lede">
+      The current wire protocol is built for debugging a young database: you
+      can drive it with a terminal and read every byte. PostgreSQL wire
+      compatibility is on the roadmap; this is the scaffolding that gets us
+      there honestly.
+    </p>
+  </header>
+  <div class="terminal" role="img" aria-label="A protocol session: create table, insert, select">
+    <p><span class="prompt">&rarr;</span> {"protocol_version":1,"request_id":1,"request":{"type":"execute","sql":"CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance DOUBLE NOT NULL)"}}</p>
+    <p><span class="prompt reply">&larr;</span> {"protocol_version":1,"request_id":1,"response":{"type":"executed","results":[{"type":"command","tag":"CREATE TABLE","affected_rows":0}]}}</p>
+    <p><span class="prompt">&rarr;</span> {"protocol_version":1,"request_id":2,"request":{"type":"execute","sql":"INSERT INTO accounts (id, balance) VALUES (1, 250.0)"}}</p>
+    <p><span class="prompt reply">&larr;</span> {"protocol_version":1,"request_id":2,"response":{"type":"executed","results":[{"type":"command","tag":"INSERT","affected_rows":1}]}}</p>
+    <p><span class="prompt">&rarr;</span> {"protocol_version":1,"request_id":3,"request":{"type":"execute","sql":"SELECT id, balance FROM accounts WHERE id = 1"}}</p>
+    <p><span class="prompt reply">&larr;</span> {"protocol_version":1,"request_id":3,"response":{"type":"executed","results":[{"type":"query","columns":[{"name":"id","data_type":"int64","nullable":false},{"name":"balance","data_type":"float64","nullable":false}],"rows":[[{"type":"integer","value":1},{"type":"float","value":250.0}]]}]}}</p>
+  </div>
+</section>
 
-    <!-- Footer -->
-    <footer class="footer">
-        <div class="container">
-            <div class="footer-content">
-                <div class="footer-logo">
-                    <i class="fas fa-database"></i>
-                    <span>QuantaDB</span>
-                </div>
-                <div class="footer-text">
-                    <p>Built with ❤️ using Rust, TypeScript, and modern web technologies</p>
-                    <p>&copy; 2024 QuantaDB. All rights reserved.</p>
-                </div>
-                <div class="footer-social">
-                    <a href="https://github.com/martian56/quantadb" target="_blank" class="social-link">
-                        <i class="fab fa-github"></i>
-                    </a>
-                    <a href="https://linkedin.com/in/martian58" target="_blank" class="social-link">
-                        <i class="fab fa-linkedin"></i>
-                    </a>
-                </div>
-            </div>
-        </div>
-    </footer>
+<section class="band" id="status">
+  <header class="band-head">
+    <p class="eyebrow">Status</p>
+    <h2>Do not store data you love in this. Yet.</h2>
+    <p class="band-lede">
+      QuantaDB is a working engine and an honest work in progress. The v0.1
+      prototype was retired; the current codebase is a clean foundation with
+      real durability guarantees and a long road ahead. Milestones are
+      numbered because they are a sequence: each one is load-bearing for the
+      next.
+    </p>
+  </header>
+  <ol class="milestones" role="list">
+    <li class="done"><span class="m">M1</span><div><h3>Syntax and server foundation</h3><p>Span-aware parser, versioned protocol, bounded connections.</p></div></li>
+    <li class="done"><span class="m">M2</span><div><h3>Durable storage kernel</h3><p>Pages, WAL, group commit, crash recovery, corruption detection.</p></div></li>
+    <li class="active"><span class="m">M3</span><div><h3>Transactions and indexes</h3><p>MVCC, online index generations, reclamation, and a concurrent
+    history checker that has already caught two real bugs. Range conflict
+    tracking remains.</p></div></li>
+    <li><span class="m">M4</span><div><h3>Execution engine</h3><p>Planner, joins, ordering, secondary indexes, cost-based decisions.</p></div></li>
+    <li><span class="m">M5</span><div><h3>Production operations</h3><p>PostgreSQL wire protocol, auth, TLS, backup, format stability.</p></div></li>
+    <li><span class="m">M6</span><div><h3>Replication</h3><p>Replicated log, failover, and adversarial failure testing before any
+    talk of distribution.</p></div></li>
+  </ol>
+</section>
 
-    <script src="https://unpkg.com/aos@2.3.1/dist/aos.js"></script>
-    <script src="scripts.js"></script>
+</main>
+
+<footer class="footer">
+  <div class="footer-inner">
+    <p>QuantaDB is MIT licensed and developed in the open.</p>
+    <nav>
+      <a href="https://github.com/martian56/quantadb">GitHub</a>
+      <a href="https://github.com/martian56/quantadb/tree/main/docs">Format documents</a>
+      <a href="https://github.com/martian56/quantadb/blob/main/docs/benchmarks.md">Benchmark method</a>
+      <a href="https://github.com/martian56/quantadb/issues">Issues</a>
+    </nav>
+  </div>
+</footer>
+
+<script>
+(function () {
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  var rows = document.querySelectorAll(".hexrow");
+  rows.forEach(function (row, index) {
+    row.style.opacity = "0";
+    row.style.transform = "translateY(4px)";
+    setTimeout(function () {
+      row.style.transition = "opacity 220ms ease, transform 220ms ease";
+      row.style.opacity = "1";
+      row.style.transform = "none";
+    }, 240 + index * 90);
+  });
+})();
+</script>
+
 </body>
 </html>
