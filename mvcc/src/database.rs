@@ -531,10 +531,7 @@ impl Inner {
         }
 
         state.completed_timestamps.insert(timestamp.0);
-        loop {
-            let Some(next) = state.visible_through.0.checked_add(1) else {
-                break;
-            };
+        while let Some(next) = state.visible_through.0.checked_add(1) {
             if !state.completed_timestamps.remove(&next) {
                 break;
             }
