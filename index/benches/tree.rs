@@ -2,7 +2,9 @@ use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use quantadb_index::{BPlusTree, IndexEntry, IndexMutation, IndexRoot};
-use quantadb_storage::{GroupCommitHandle, GroupCommitOptions, GroupCommitter, PageId, StoreOptions};
+use quantadb_storage::{
+    GroupCommitHandle, GroupCommitOptions, GroupCommitter, PageId, StoreOptions,
+};
 use tempfile::TempDir;
 
 const TREE_ENTRIES: u64 = 100_000;

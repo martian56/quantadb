@@ -75,7 +75,9 @@ fn prefix_scan(c: &mut Criterion) {
     group.bench_function("prefix_scan_1k", |b| {
         b.iter(|| {
             let txn = database.begin().expect("begin must succeed");
-            let rows = txn.scan_prefix(black_box(b"bench/")).expect("scan must succeed");
+            let rows = txn
+                .scan_prefix(black_box(b"bench/"))
+                .expect("scan must succeed");
             txn.rollback().expect("rollback must succeed");
             rows
         });

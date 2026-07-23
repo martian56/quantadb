@@ -89,9 +89,7 @@ fn parse_args() -> Result<Option<Config>, String> {
         if flag == "--help" {
             return Ok(None);
         }
-        let value = args
-            .next()
-            .ok_or_else(|| format!("{flag} needs a value"))?;
+        let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
             "--address" => config.address = value,
             "--connections" => config.connections = parse_number(&flag, &value)? as usize,
@@ -133,7 +131,9 @@ fn run(config: &Config) -> Result<(), String> {
     let mut handles = Vec::with_capacity(config.connections);
     for worker in 0..config.connections {
         let config = config.clone();
-        handles.push(thread::spawn(move || worker_loop(&config, worker, deadline)));
+        handles.push(thread::spawn(move || {
+            worker_loop(&config, worker, deadline)
+        }));
     }
 
     let mut report = WorkerReport::default();
@@ -181,11 +181,7 @@ fn expect_success(connection: &mut Connection, sql: &str) -> Result<(), String> 
     }
 }
 
-fn worker_loop(
-    config: &Config,
-    worker: usize,
-    deadline: Instant,
-) -> Result<WorkerReport, String> {
+fn worker_loop(config: &Config, worker: usize, deadline: Instant) -> Result<WorkerReport, String> {
     let mut connection = Connection::open(&config.address)?;
     let mut report = WorkerReport::default();
     let mut rng = 0x9e37_79b9_7f4a_7c15_u64 ^ ((worker as u64 + 1) << 17);

@@ -91,5 +91,10 @@ fn scan_with_predicate(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, autocommit_insert, point_select, scan_with_predicate);
+criterion_group!(
+    benches,
+    autocommit_insert,
+    point_select,
+    scan_with_predicate
+);
 criterion_main!(benches);
