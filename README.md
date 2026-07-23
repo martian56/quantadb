@@ -84,5 +84,6 @@ PostgreSQL-compatible client support. Distributed operation comes after
 single-node recovery, transactions, and replication are trustworthy.
 
 See [the architecture roadmap](docs/architecture.md) for milestone boundaries,
-[the MVCC design](docs/mvcc.md) for transaction semantics, and the
-[index format](docs/index-format-v1.md) for persistent tree invariants.
+[the MVCC design](docs/mvcc.md) for transaction semantics, the
+[index format](docs/index-format-v1.md) for persistent tree invariants, and
+[the benchmark guide](docs/benchmarks.md) for how performance is measured.
