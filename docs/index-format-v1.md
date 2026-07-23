@@ -80,8 +80,6 @@ free to use the group-commit pipeline.
 - Old generations are not reclaimed.
 - The published generation follows commits asynchronously; reads newer than
   the latest generation use the in-memory version map.
-- Node reads go through the group-commit thread without a node cache, which
-  the baseline shows is the dominant cost of an indexed lookup.
 - Values are physical page IDs; covering and composite SQL key encodings will
   be added with the catalog/type layer.
 - Prefix compression and tuned fill factors are not implemented.

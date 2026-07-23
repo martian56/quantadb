@@ -468,7 +468,8 @@ impl Inner {
         let Some(root) = root else {
             return Ok(None);
         };
-        let Some(page_id) = BPlusTree::get(&self.storage, Some(&self.node_cache), root, key)? else {
+        let Some(page_id) = BPlusTree::get(&self.storage, Some(&self.node_cache), root, key)?
+        else {
             return Ok(None);
         };
         self.read_index_version(page_id, key, snapshot)

@@ -531,7 +531,9 @@ impl Editor<'_> {
         if let Some(node) = self.overlay.get(&page_id) {
             return Ok(node.clone());
         }
-        Ok(read_node(self.storage, self.cache, page_id)?.as_ref().clone())
+        Ok(read_node(self.storage, self.cache, page_id)?
+            .as_ref()
+            .clone())
     }
 
     fn finish(self) -> Result<IndexBuildPlan> {
@@ -948,7 +950,8 @@ mod tests {
             None
         );
         assert_eq!(
-            BPlusTree::get(&handle, None, edited_root, b"key:00001234:after").expect("inserted get"),
+            BPlusTree::get(&handle, None, edited_root, b"key:00001234:after")
+                .expect("inserted get"),
             Some(PageId(900_002))
         );
 

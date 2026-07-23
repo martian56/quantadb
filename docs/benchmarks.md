@@ -63,9 +63,10 @@ Median criterion times:
 | buffer_pool/cached_read | 29 ns |
 | store/durable_write_page | 13.3 ms |
 | store/group_commit_8_pages | 16.1 ms |
-| tree/point_lookup_100k | 117 us |
-| tree/range_scan_100_of_100k | 153 us |
-| tree/edit_plan_100_upserts | 17.7 ms |
+| tree/point_lookup_100k_uncached | 66.7 us |
+| tree/point_lookup_100k_cached | 705 ns |
+| tree/range_scan_100_of_100k | 13.3 us |
+| tree/edit_plan_100_upserts | 10.9 ms |
 | mvcc/single_key_commit | 16.1 ms |
 | mvcc/snapshot_point_read_10k | 583 ns |
 | mvcc/prefix_scan_1k | 352 us |
@@ -82,8 +83,9 @@ What the baseline already says about the code:
 - Every durable operation on this disk costs roughly 16 ms of sync time.
   That is the disk, not the code, and it is why write latency percentiles
   and durable microbenches cluster there. A faster disk moves all of them.
-- A B+ tree point lookup takes 117 us while an in-memory snapshot read
-  takes 583 ns. Every node visit is a round trip through the group commit
-  thread with no node caching, which is an obvious place to win.
+- The node cache closed the index gap: a hot B+ tree point lookup costs
+  705 ns against 583 ns for an in-memory snapshot read. The uncached path
+  still pays 66.7 us because every node visit locks the shared store,
+  reads the page, and verifies its checksum.
 - The filtered scan takes 18 ms against 14 us for the point path on the
   same 10 thousand rows. That is the gap secondary indexes have to close.
