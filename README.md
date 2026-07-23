@@ -68,6 +68,7 @@ request ID.
 | Variable | Default |
 |---|---:|
 | `QUANTA_LISTEN_ADDRESS` | `127.0.0.1:54321` |
+| `QUANTA_PG_LISTEN_ADDRESS` | `127.0.0.1:55432` |
 | `QUANTA_DATA_DIR` | `quantadb-data` |
 | `QUANTA_MAX_CONNECTIONS` | `1024` |
 | `QUANTA_MAX_IN_FLIGHT_REQUESTS` | `256` |

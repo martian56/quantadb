@@ -31,4 +31,10 @@ jobs:
           server_pid=$!
           sleep 2
           ./target/release/loadgen --seconds 3 --connections 4 --rows 2000
+          psql "host=127.0.0.1 port=55432 user=quanta dbname=quanta" \
+            -v ON_ERROR_STOP=1 \
+            -c "CREATE TABLE smoke (id BIGINT PRIMARY KEY, note TEXT NOT NULL)" \
+            -c "INSERT INTO smoke (id, note) VALUES (1, 'hello from psql')" \
+            -c "SELECT id, note FROM smoke ORDER BY id" \
+            -c "BEGIN" -c "ROLLBACK"
           kill "$server_pid"
