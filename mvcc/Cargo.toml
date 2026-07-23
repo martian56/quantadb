@@ -1,0 +1,19 @@
+[package]
+name = "quantadb-mvcc"
+description = "Durable snapshot-isolation transaction layer for QuantaDB"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+quantadb-index = { path = "../index" }
+quantadb-storage = { path = "../storage" }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

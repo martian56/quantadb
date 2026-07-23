@@ -1,158 +1,88 @@
-# QuantaDB 🚀
+# QuantaDB
 
-A modern, fast database management system built with Rust, featuring a custom SQL dialect (QuantaSQL) and multiple client interfaces.
+QuantaDB is an experimental relational database being rebuilt in Rust around
+three non-negotiable goals:
 
-## Features
+1. correctness under concurrency and crashes;
+2. predictable low-tail latency for durable OLTP workloads;
+3. reproducible, honest performance measurements.
 
-- **Custom SQL Language (QuantaSQL)**: Simplified SQL dialect focusing on essential operations
-- **High Performance**: Built with Rust for speed and memory safety
-- **Multiple Client Interfaces**: Rust, Python, and Desktop clients
-- **Real-time Query Execution**: TCP-based protocol for fast communication
-- **Cross-platform**: Works on Windows, macOS, and Linux
+The old v0.1 proof of concept remains available in Git history. The current
+`0.2.0` codebase is a clean foundation and is **not yet a database you should
+use for data storage**.
 
-## Architecture
+## Current milestone
 
-```
-QuantaDB/
-├── server/          # Core database server
-├── connectors/      # Client libraries
-│   ├── rust-client/ # Rust client library
-│   └── python-client/ # Python client library
-├── client/          # Desktop client (Tauri + Vue.js)
-├── client-web/      # Web interface for desktop client
-└── docs/           # Documentation
-```
+The repository currently contains:
 
-## Quick Start
+- `syntax/` — a dependency-light, span-aware SQL lexer, AST, and parser;
+- `storage/` — checksummed pages, physical WAL, recovery, and bounded caching;
+- `index/` — persistent immutable B+ tree generations for point/range access;
+- `mvcc/` — durable snapshot transactions with first-committer-wins conflicts;
+- `engine/` — durable relational catalog, constraints, and transactional CRUD;
+- `server/` — a bounded, concurrent, versioned TCP protocol server;
+- `docs/` — syntax, protocol, and architecture documentation.
 
-### 1. Start the Server
+The server exposes health, SQL parsing, and transactional SQL execution.
+Connection-scoped `BEGIN`/`COMMIT` state is isolated across clients and all
+engine work is admitted through a bounded blocking-work pool.
 
-```bash
-cd server
-cargo run
-```
+The current development focus is finishing M3: online generation publication,
+version reclamation, and stronger concurrent history checking.
 
-The server will start on `127.0.0.1:5432`.
+## Build and test
 
-### 2. Use the Desktop Client
+Rust 1.85 or newer is required.
 
 ```bash
-cd client
-cargo tauri dev
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-### 3. Use the Rust Client
+Start the server:
 
 ```bash
-cd connectors/rust-client
-cargo run --example basic_usage
+cargo run -p quantadb-server
 ```
 
-### 4. Use the Python Client
+It listens on `127.0.0.1:54321` by default.
 
-```bash
-cd connectors/python-client
-pip install -e .
-python examples/basic_usage.py
+## Protocol example
+
+Each protocol frame is one UTF-8 JSON object followed by a newline:
+
+```json
+{"protocol_version":1,"request_id":1,"request":{"type":"ping"}}
 ```
 
-## QuantaSQL Examples
-
-```sql
--- Create a table
-CREATE TABLE users (id INT, name TEXT, age INT);
-
--- Insert data
-INSERT INTO users VALUES (1, "Alice", 25);
-INSERT INTO users VALUES (2, "Bob", 30);
-
--- Query data
-SELECT * FROM users;
-SELECT name FROM users WHERE age > 25;
-
--- Delete data
-DELETE FROM users WHERE id = 1;
+```json
+{"protocol_version":1,"request_id":2,"request":{"type":"parse","sql":"SELECT id FROM users WHERE active = true"}}
 ```
 
-## Supported SQL Operations
+The server never sends unsolicited frames. Every response carries the matching
+request ID.
 
-- `CREATE TABLE` - Create new tables
-- `DROP TABLE` - Remove tables
-- `INSERT INTO ... VALUES` - Insert data
-- `SELECT ... FROM ... WHERE` - Query data
-- `DELETE FROM ... WHERE` - Delete data
+## Configuration
 
-## Data Types
+| Variable | Default |
+|---|---:|
+| `QUANTA_LISTEN_ADDRESS` | `127.0.0.1:54321` |
+| `QUANTA_DATA_DIR` | `quantadb-data` |
+| `QUANTA_MAX_CONNECTIONS` | `1024` |
+| `QUANTA_MAX_IN_FLIGHT_REQUESTS` | `256` |
+| `QUANTA_MAX_FRAME_BYTES` | `1048576` |
+| `QUANTA_IDLE_TIMEOUT_SECS` | `300` |
+| `QUANTA_SHUTDOWN_GRACE_SECS` | `5` |
 
-- `INT` - 64-bit signed integer
-- `TEXT` - Variable-length string
-- `BOOL` - Boolean (true/false)
-- `FLOAT` - 64-bit floating point number
+Logging is controlled with the standard `RUST_LOG` environment variable.
 
-## Development
+## Project direction
 
-### Building the Server
+The target is a Linux-first, durable, single-node OLTP database with
+PostgreSQL-compatible client support. Distributed operation comes after
+single-node recovery, transactions, and replication are trustworthy.
 
-```bash
-cd server
-cargo build --release
-```
-
-### Building the Desktop Client
-
-```bash
-cd client
-cargo tauri build
-```
-
-### Building the Python Client
-
-```bash
-cd connectors/python-client
-maturin develop
-```
-
-## Project Status
-
-This is a proof-of-concept implementation demonstrating:
-
-- ✅ Custom SQL parser and AST
-- ✅ In-memory storage engine
-- ✅ TCP server with custom protocol
-- ✅ Rust client library
-- ✅ Python client library (PyO3)
-- ✅ Desktop client (Tauri + Vue.js)
-- ✅ Basic CRUD operations
-- ✅ WHERE clause filtering
-- ✅ Type system with validation
-
-## Future Roadmap
-
-- [ ] Persistent storage (disk-based)
-- [ ] Indexes for faster queries
-- [ ] Transactions and ACID properties
-- [ ] JOIN operations
-- [ ] Aggregate functions
-- [ ] Network clustering
-- [ ] Query optimization
-- [ ] Backup and recovery
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests
-5. Submit a pull request
-
-## License
-
-MIT License - see LICENSE file for details.
-
-## Acknowledgments
-
-- Built with [Rust](https://rust-lang.org/)
-- SQL parsing with [sqlparser-rs](https://github.com/sqlparser-rs/sqlparser-rs)
-- Desktop client with [Tauri](https://tauri.app/)
-- Web interface with [Vue.js](https://vuejs.org/)
-- Python bindings with [PyO3](https://pyo3.rs/)
+See [the architecture roadmap](docs/architecture.md) for milestone boundaries,
+[the MVCC design](docs/mvcc.md) for transaction semantics, and the
+[index format](docs/index-format-v1.md) for persistent tree invariants.

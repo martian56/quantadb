@@ -1,6 +1,6 @@
 [package]
-name = "quantadb-server"
-description = "QuantaDB network server"
+name = "quantadb-engine"
+description = "Relational catalog and SQL execution engine for QuantaDB"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,15 +8,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-quantadb-engine = { path = "../engine" }
 quantadb-mvcc = { path = "../mvcc" }
 quantadb-syntax = { path = "../syntax" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
