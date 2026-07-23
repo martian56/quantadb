@@ -8,7 +8,8 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     mem,
     path::Path,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Condvar, Mutex, MutexGuard},
+    thread,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -17,10 +18,25 @@ pub struct Timestamp(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TransactionId(pub u64);
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MvccOptions {
     pub store: StoreOptions,
     pub group_commit: GroupCommitOptions,
+    /// Publish index generations from a background thread after commits.
+    ///
+    /// When disabled, generations advance only through explicit
+    /// `rebuild_index` or `checkpoint` calls.
+    pub online_index: bool,
+}
+
+impl Default for MvccOptions {
+    fn default() -> Self {
+        Self {
+            store: StoreOptions::default(),
+            group_commit: GroupCommitOptions::default(),
+            online_index: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -64,16 +80,27 @@ struct State {
     next_commit_timestamp: u64,
     visible_through: Timestamp,
     index_generation: Option<IndexGeneration>,
+    /// Keys with committed versions the published generation may not cover.
+    dirty_keys: BTreeSet<Vec<u8>>,
+}
+
+#[derive(Default)]
+struct PublishSignal {
+    dirty: bool,
+    stop: bool,
 }
 
 struct Inner {
     state: Mutex<State>,
     storage: GroupCommitHandle,
+    publish_signal: Mutex<PublishSignal>,
+    publish_wake: Condvar,
 }
 
 pub struct MvccDatabase {
     inner: Arc<Inner>,
-    committer: GroupCommitter,
+    committer: Option<GroupCommitter>,
+    publisher: Option<thread::JoinHandle<()>>,
 }
 
 pub struct Transaction {
@@ -139,22 +166,47 @@ impl MvccDatabase {
         if let Some(root) = index_generation.and_then(|generation| generation.root) {
             BPlusTree::range(&storage, root, None, None, 1)?;
         }
-        Ok(Self {
-            inner: Arc::new(Inner {
-                state: Mutex::new(State {
-                    versions,
-                    intents: HashMap::new(),
-                    active: HashMap::new(),
-                    completed_timestamps: BTreeSet::new(),
-                    next_transaction_id: 1,
-                    next_commit_timestamp,
-                    visible_through: Timestamp(maximum_timestamp),
-                    index_generation,
-                }),
-                storage,
+        let indexed_through =
+            index_generation.map_or(Timestamp(0), |generation| generation.timestamp);
+        let dirty_keys: BTreeSet<Vec<u8>> = versions
+            .iter()
+            .filter(|(_, versions)| {
+                versions
+                    .iter()
+                    .any(|version| version.timestamp > indexed_through)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        let needs_catch_up = !dirty_keys.is_empty();
+        let inner = Arc::new(Inner {
+            state: Mutex::new(State {
+                versions,
+                intents: HashMap::new(),
+                active: HashMap::new(),
+                completed_timestamps: BTreeSet::new(),
+                next_transaction_id: 1,
+                next_commit_timestamp,
+                visible_through: Timestamp(maximum_timestamp),
+                index_generation,
+                dirty_keys,
             }),
-            committer,
-        })
+            storage,
+            publish_signal: Mutex::new(PublishSignal::default()),
+            publish_wake: Condvar::new(),
+        });
+        let publisher = options.online_index.then(|| {
+            let worker = Arc::clone(&inner);
+            thread::spawn(move || worker.publish_loop())
+        });
+        let database = Self {
+            inner,
+            committer: Some(committer),
+            publisher,
+        };
+        if options.online_index && needs_catch_up {
+            database.inner.mark_index_dirty();
+        }
+        Ok(database)
     }
 
     pub fn begin(&self) -> Result<Transaction> {
@@ -178,17 +230,8 @@ impl MvccDatabase {
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let state = self.inner.lock_state()?;
-        let snapshot = state.visible_through;
-        let root = state
-            .index_generation
-            .filter(|generation| generation.timestamp == snapshot)
-            .map(|generation| generation.root);
-        if let Some(root) = root {
-            drop(state);
-            return self.inner.read_indexed(root, key, snapshot);
-        }
-        Ok(read_version(&state, key, snapshot))
+        let snapshot = self.inner.lock_state()?.visible_through;
+        self.inner.read(key, snapshot)
     }
 
     pub fn checkpoint(&self) -> Result<Timestamp> {
@@ -198,93 +241,7 @@ impl MvccDatabase {
     }
 
     pub fn rebuild_index(&self) -> Result<IndexBuildResult> {
-        let (timestamp, base_generation, live_entries, mutations) = {
-            let state = self.inner.lock_state()?;
-            let timestamp = state.visible_through;
-            let base_generation = state.index_generation;
-            if base_generation.is_some_and(|generation| generation.timestamp == timestamp) {
-                return Ok(IndexBuildResult {
-                    timestamp,
-                    root: base_generation.and_then(|generation| generation.root),
-                });
-            }
-            let live_entries = base_generation
-                .is_none()
-                .then(|| current_index_entries(&state.versions, timestamp).collect::<Vec<_>>());
-            let mutations = base_generation.map(|generation| {
-                state
-                    .versions
-                    .iter()
-                    .filter(|(_, versions)| {
-                        versions.iter().any(|version| {
-                            version.timestamp > generation.timestamp
-                                && version.timestamp <= timestamp
-                        })
-                    })
-                    .filter_map(|(key, versions)| {
-                        versions
-                            .iter()
-                            .rev()
-                            .find(|version| version.timestamp <= timestamp)
-                            .map(|version| {
-                                version.value.as_ref().map_or_else(
-                                    || IndexMutation::Delete(key.clone()),
-                                    |_| {
-                                        IndexMutation::Upsert(IndexEntry {
-                                            key: key.clone(),
-                                            value: version.page_id,
-                                        })
-                                    },
-                                )
-                            })
-                    })
-                    .collect::<Vec<_>>()
-            });
-            (timestamp, base_generation, live_entries, mutations)
-        };
-
-        let plan = if let Some(generation) = base_generation {
-            BPlusTree::edit_plan(
-                &self.inner.storage,
-                generation.root,
-                mutations.unwrap_or_default(),
-            )?
-        } else {
-            BPlusTree::plan(&self.inner.storage, live_entries.unwrap_or_default())?
-        };
-        let root = plan.root();
-        let manifest_page_id = self
-            .inner
-            .storage
-            .reserve_page_ids(1)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                TransactionError::Storage(quantadb_storage::StorageError::GroupCommit(
-                    "manifest page reservation returned no page".to_owned(),
-                ))
-            })?;
-        let generation = IndexGeneration {
-            timestamp,
-            root,
-            manifest_page_id,
-        };
-        let mut writes = plan.into_writes();
-        writes.push(PageWrite {
-            page_id: manifest_page_id,
-            payload: generation.encode(),
-        });
-        self.inner.storage.commit(writes)?;
-
-        let mut state = self.inner.lock_state()?;
-        let should_publish = state.index_generation.is_none_or(|current| {
-            (generation.timestamp, generation.manifest_page_id)
-                >= (current.timestamp, current.manifest_page_id)
-        });
-        if should_publish {
-            state.index_generation = Some(generation);
-        }
-        Ok(IndexBuildResult { timestamp, root })
+        self.inner.rebuild_index()
     }
 
     pub fn stats(&self) -> Result<MvccStats> {
@@ -310,9 +267,29 @@ impl MvccDatabase {
         })
     }
 
-    pub fn shutdown(self) -> Result<()> {
-        self.committer.shutdown()?;
+    pub fn shutdown(mut self) -> Result<()> {
+        self.stop_publisher();
+        if let Some(committer) = self.committer.take() {
+            committer.shutdown()?;
+        }
         Ok(())
+    }
+
+    fn stop_publisher(&mut self) {
+        let Some(handle) = self.publisher.take() else {
+            return;
+        };
+        if let Ok(mut signal) = self.inner.publish_signal.lock() {
+            signal.stop = true;
+        }
+        self.inner.publish_wake.notify_all();
+        let _ = handle.join();
+    }
+}
+
+impl Drop for MvccDatabase {
+    fn drop(&mut self) {
+        self.stop_publisher();
     }
 }
 
@@ -323,17 +300,153 @@ impl Inner {
             .map_err(|_| TransactionError::StatePoisoned)
     }
 
+    /// Background thread body: rebuild the persistent generation whenever
+    /// commits mark the index dirty, until shutdown.
+    ///
+    /// A failed rebuild is retried on the next commit signal instead of
+    /// looping; the in-memory version map keeps every read correct while the
+    /// persistent generation lags.
+    fn publish_loop(&self) {
+        loop {
+            let Ok(mut signal) = self.publish_signal.lock() else {
+                return;
+            };
+            while !signal.dirty && !signal.stop {
+                let Ok(next) = self.publish_wake.wait(signal) else {
+                    return;
+                };
+                signal = next;
+            }
+            if signal.stop {
+                return;
+            }
+            signal.dirty = false;
+            drop(signal);
+            let _ = self.rebuild_index();
+        }
+    }
+
+    fn mark_index_dirty(&self) {
+        if let Ok(mut signal) = self.publish_signal.lock() {
+            signal.dirty = true;
+        }
+        self.publish_wake.notify_one();
+    }
+
+    fn rebuild_index(&self) -> Result<IndexBuildResult> {
+        let (timestamp, base_generation, live_entries, mutations) = {
+            let state = self.lock_state()?;
+            let timestamp = state.visible_through;
+            let base_generation = state.index_generation;
+            if base_generation.is_some_and(|generation| generation.timestamp == timestamp) {
+                return Ok(IndexBuildResult {
+                    timestamp,
+                    root: base_generation.and_then(|generation| generation.root),
+                });
+            }
+            let live_entries = base_generation
+                .is_none()
+                .then(|| current_index_entries(&state.versions, timestamp).collect::<Vec<_>>());
+            let mutations = base_generation.map(|generation| {
+                state
+                    .dirty_keys
+                    .iter()
+                    .filter_map(|key| {
+                        let newest = state
+                            .versions
+                            .get(key)?
+                            .iter()
+                            .rev()
+                            .find(|version| version.timestamp <= timestamp)?;
+                        if newest.timestamp <= generation.timestamp {
+                            return None;
+                        }
+                        Some(newest.value.as_ref().map_or_else(
+                            || IndexMutation::Delete(key.clone()),
+                            |_| {
+                                IndexMutation::Upsert(IndexEntry {
+                                    key: key.clone(),
+                                    value: newest.page_id,
+                                })
+                            },
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            });
+            (timestamp, base_generation, live_entries, mutations)
+        };
+
+        let plan = if let Some(generation) = base_generation {
+            BPlusTree::edit_plan(&self.storage, generation.root, mutations.unwrap_or_default())?
+        } else {
+            BPlusTree::plan(&self.storage, live_entries.unwrap_or_default())?
+        };
+        let root = plan.root();
+        let manifest_page_id = self
+            .storage
+            .reserve_page_ids(1)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                TransactionError::Storage(quantadb_storage::StorageError::GroupCommit(
+                    "manifest page reservation returned no page".to_owned(),
+                ))
+            })?;
+        let generation = IndexGeneration {
+            timestamp,
+            root,
+            manifest_page_id,
+        };
+        let mut writes = plan.into_writes();
+        writes.push(PageWrite {
+            page_id: manifest_page_id,
+            payload: generation.encode(),
+        });
+        self.storage.commit(writes)?;
+
+        let mut state = self.lock_state()?;
+        let should_publish = state.index_generation.is_none_or(|current| {
+            (generation.timestamp, generation.manifest_page_id)
+                >= (current.timestamp, current.manifest_page_id)
+        });
+        if should_publish {
+            state.index_generation = Some(generation);
+        }
+        let State {
+            versions,
+            dirty_keys,
+            ..
+        } = &mut *state;
+        dirty_keys.retain(|key| {
+            versions.get(key).is_some_and(|versions| {
+                versions
+                    .iter()
+                    .any(|version| version.timestamp > timestamp)
+            })
+        });
+        Ok(IndexBuildResult { timestamp, root })
+    }
+
+    /// Read one key at a snapshot.
+    ///
+    /// The in-memory version map is authoritative for every key it holds.
+    /// Only keys absent from the map fall through to the newest persistent
+    /// generation that is not newer than the snapshot.
     fn read(&self, key: &[u8], snapshot: Timestamp) -> Result<Option<Vec<u8>>> {
         let state = self.lock_state()?;
+        if let Some(versions) = state.versions.get(key) {
+            return Ok(versions
+                .iter()
+                .rev()
+                .find(|version| version.timestamp <= snapshot)
+                .and_then(|version| version.value.clone()));
+        }
         let root = state
             .index_generation
-            .filter(|generation| generation.timestamp == snapshot)
+            .filter(|generation| generation.timestamp <= snapshot)
             .map(|generation| generation.root);
-        if let Some(root) = root {
-            drop(state);
-            return self.read_indexed(root, key, snapshot);
-        }
-        Ok(read_version(&state, key, snapshot))
+        drop(state);
+        root.map_or(Ok(None), |root| self.read_indexed(root, key, snapshot))
     }
 
     fn read_indexed(
@@ -349,36 +462,6 @@ impl Inner {
             return Ok(None);
         };
         self.read_index_version(page_id, key, snapshot)
-    }
-
-    fn scan_indexed(
-        &self,
-        root: Option<IndexRoot>,
-        prefix: &[u8],
-        snapshot: Timestamp,
-    ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
-        let Some(root) = root else {
-            return Ok(BTreeMap::new());
-        };
-        let end = prefix_end(prefix);
-        BPlusTree::range(
-            &self.storage,
-            root,
-            Some(prefix),
-            end.as_deref(),
-            usize::MAX,
-        )?
-        .into_iter()
-        .map(|entry| {
-            let value = self
-                .read_index_version(entry.value, &entry.key, snapshot)?
-                .ok_or_else(|| TransactionError::CorruptRecord {
-                    page_id: entry.value,
-                    reason: "live-key index points to a tombstone".to_owned(),
-                })?;
-            Ok((entry.key, value))
-        })
-        .collect()
     }
 
     fn read_index_version(
@@ -527,6 +610,7 @@ impl Inner {
                         page_id: *page_id,
                     },
                 );
+                state.dirty_keys.insert(key.clone());
             }
         }
 
@@ -567,6 +651,7 @@ impl Inner {
         match self.persist_commit(timestamp, &writes) {
             Ok(page_ids) => {
                 self.finish_prepared(transaction_id, timestamp, &writes, Some(&page_ids))?;
+                self.mark_index_dirty();
                 Ok(CommitResult {
                     timestamp: Some(timestamp),
                     writes: writes.len(),
@@ -619,22 +704,46 @@ impl Transaction {
     pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.ensure_active()?;
         let state = self.inner.lock_state()?;
-        let generation = state
+        let mut masked = BTreeSet::new();
+        let mut results = BTreeMap::new();
+        for (key, versions) in version_range(&state.versions, prefix) {
+            masked.insert(key.clone());
+            if let Some(value) = versions
+                .iter()
+                .rev()
+                .find(|version| version.timestamp <= self.snapshot)
+                .and_then(|version| version.value.clone())
+            {
+                results.insert(key.clone(), value);
+            }
+        }
+        let root = state
             .index_generation
-            .filter(|generation| generation.timestamp == self.snapshot)
-            .map(|generation| generation.root);
-        let mut results = if let Some(root) = generation {
-            drop(state);
-            self.inner.scan_indexed(root, prefix, self.snapshot)?
-        } else {
-            let results = version_range(&state.versions, prefix)
-                .filter_map(|(key, _)| {
-                    read_version(&state, key, self.snapshot).map(|value| (key.clone(), value))
-                })
-                .collect::<BTreeMap<_, _>>();
-            drop(state);
-            results
-        };
+            .filter(|generation| generation.timestamp <= self.snapshot)
+            .and_then(|generation| generation.root);
+        drop(state);
+
+        if let Some(root) = root {
+            let end = prefix_end(prefix);
+            let entries = BPlusTree::range(
+                &self.inner.storage,
+                root,
+                Some(prefix),
+                end.as_deref(),
+                usize::MAX,
+            )?;
+            for entry in entries {
+                if masked.contains(&entry.key) {
+                    continue;
+                }
+                if let Some(value) =
+                    self.inner
+                        .read_index_version(entry.value, &entry.key, self.snapshot)?
+                {
+                    results.insert(entry.key, value);
+                }
+            }
+        }
 
         for (key, value) in self
             .writes
@@ -682,17 +791,6 @@ impl Drop for Transaction {
             self.finished = true;
         }
     }
-}
-
-fn read_version(state: &State, key: &[u8], snapshot: Timestamp) -> Option<Vec<u8>> {
-    state
-        .versions
-        .get(key)?
-        .iter()
-        .rev()
-        .find(|version| version.timestamp <= snapshot)?
-        .value
-        .clone()
 }
 
 fn current_index_entries(
@@ -748,8 +846,33 @@ mod tests {
     };
     use tempfile::tempdir;
 
+    /// Open with background publication disabled so index timing assertions
+    /// stay deterministic. Online behavior has its own tests.
     fn open_database(path: &Path) -> MvccDatabase {
-        MvccDatabase::open(path, MvccOptions::default()).expect("open database")
+        MvccDatabase::open(path, offline_options()).expect("open database")
+    }
+
+    fn offline_options() -> MvccOptions {
+        MvccOptions {
+            online_index: false,
+            ..MvccOptions::default()
+        }
+    }
+
+    fn wait_for_indexed_through(database: &MvccDatabase, target: Timestamp) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let stats = database.stats().expect("stats");
+            if stats.indexed_through == Some(target) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "publisher stalled at {:?} before reaching {target:?}",
+                stats.indexed_through
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -853,6 +976,7 @@ mod tests {
                     max_batch_pages: 32,
                     max_delay: Duration::from_millis(25),
                 },
+                online_index: false,
             },
         )
         .expect("open");
