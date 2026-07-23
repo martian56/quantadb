@@ -25,3 +25,10 @@ jobs:
         run: cargo test --workspace --all-targets
       - name: Build release
         run: cargo build --workspace --release
+      - name: End to end smoke
+        run: |
+          QUANTA_DATA_DIR="$RUNNER_TEMP/quantadb-smoke" ./target/release/quantadb-server &
+          server_pid=$!
+          sleep 2
+          ./target/release/loadgen --seconds 3 --connections 4 --rows 2000
+          kill "$server_pid"
