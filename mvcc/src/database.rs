@@ -215,6 +215,12 @@ pub struct Transaction {
     id: TransactionId,
     snapshot: Timestamp,
     writes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    /// Prefixes this transaction scanned while range protection was on.
+    ///
+    /// A cell so read paths stay shared borrows; a transaction is owned by
+    /// one thread at a time, never shared.
+    scanned_prefixes: std::cell::RefCell<Vec<Vec<u8>>>,
+    range_protected: bool,
     finished: bool,
 }
 
@@ -340,6 +346,8 @@ impl MvccDatabase {
             id,
             snapshot,
             writes: BTreeMap::new(),
+            scanned_prefixes: std::cell::RefCell::new(Vec::new()),
+            range_protected: false,
             finished: false,
         })
     }
@@ -633,6 +641,7 @@ impl Inner {
         transaction_id: TransactionId,
         snapshot: Timestamp,
         keys: impl Iterator<Item = Vec<u8>>,
+        scanned_prefixes: &[Vec<u8>],
     ) -> Result<Timestamp> {
         let keys = keys.collect::<Vec<_>>();
         let mut state = self.lock_state()?;
@@ -652,6 +661,28 @@ impl Inner {
                 .is_some_and(|version| version.timestamp > snapshot)
             {
                 return Err(TransactionError::WriteConflict { key: key.clone() });
+            }
+        }
+
+        // First-committer-wins for predicates: a protected scan conflicts
+        // with any commit, or in-flight intent, that landed under one of
+        // its prefixes after the snapshot. Reclamation never removes
+        // versions above the oldest active snapshot, so every version this
+        // check needs is still in the map.
+        for prefix in scanned_prefixes {
+            let newer_version = version_range(&state.versions, prefix).any(|(_, versions)| {
+                versions
+                    .last()
+                    .is_some_and(|version| version.timestamp > snapshot)
+            });
+            let foreign_intent = state
+                .intents
+                .iter()
+                .any(|(key, owner)| *owner != transaction_id && key.starts_with(prefix.as_slice()));
+            if newer_version || foreign_intent {
+                return Err(TransactionError::RangeConflict {
+                    prefix: prefix.clone(),
+                });
             }
         }
 
@@ -770,6 +801,7 @@ impl Inner {
         transaction_id: TransactionId,
         snapshot: Timestamp,
         writes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+        scanned_prefixes: &[Vec<u8>],
     ) -> Result<CommitResult> {
         if writes.is_empty() {
             return Ok(CommitResult {
@@ -782,6 +814,7 @@ impl Inner {
             transaction_id,
             snapshot,
             writes.iter().map(|(key, _)| key.clone()),
+            scanned_prefixes,
         )?;
 
         match self.persist_commit(timestamp, &writes) {
@@ -837,8 +870,31 @@ impl Transaction {
         Ok(())
     }
 
+    /// Track scanned prefixes and refuse to commit writes if another
+    /// transaction commits anything under them first.
+    ///
+    /// Snapshot isolation alone does not prevent phantoms: two transactions
+    /// can scan the same range, see the same rows, and insert disjoint keys
+    /// that each invalidate the other's reasoning. With protection on, the
+    /// first committer wins and the second aborts with a range conflict,
+    /// the same policy point writes already follow. Read-only commits are
+    /// unaffected; a snapshot read is already consistent.
+    pub fn protect_scans(&mut self) {
+        self.range_protected = true;
+    }
+
     pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.ensure_active()?;
+        if self.range_protected {
+            let mut scanned = self.scanned_prefixes.borrow_mut();
+            if !scanned
+                .iter()
+                .any(|existing| prefix.starts_with(existing.as_slice()))
+            {
+                scanned.retain(|existing| !existing.starts_with(prefix));
+                scanned.push(prefix.to_vec());
+            }
+        }
         let state = self.inner.lock_state()?;
         let mut masked = BTreeSet::new();
         let mut results = BTreeMap::new();
@@ -900,7 +956,8 @@ impl Transaction {
     pub fn commit(mut self) -> Result<CommitResult> {
         self.ensure_active()?;
         let writes = mem::take(&mut self.writes);
-        let result = self.inner.commit(self.id, self.snapshot, writes);
+        let prefixes = self.scanned_prefixes.take();
+        let result = self.inner.commit(self.id, self.snapshot, writes, &prefixes);
         self.finished = true;
         self.inner.end_transaction(self.id)?;
         result
@@ -1450,6 +1507,75 @@ mod tests {
     }
 
     #[test]
+    fn protected_scans_conflict_with_phantom_inserts() {
+        let directory = tempdir().expect("tempdir");
+        let database = open_database(directory.path());
+        let mut seed = database.begin().expect("begin seed");
+        seed.put(b"acct/1", b"100").expect("put");
+        seed.commit().expect("commit seed");
+
+        let mut first = database.begin().expect("begin first");
+        first.protect_scans();
+        let mut second = database.begin().expect("begin second");
+        second.protect_scans();
+
+        assert_eq!(first.scan_prefix(b"acct/").expect("scan").len(), 1);
+        assert_eq!(second.scan_prefix(b"acct/").expect("scan").len(), 1);
+
+        first.put(b"acct/2", b"from first").expect("put first");
+        second.put(b"acct/3", b"from second").expect("put second");
+
+        first.commit().expect("the first committer wins");
+        assert!(
+            matches!(
+                second.commit(),
+                Err(TransactionError::RangeConflict { prefix }) if prefix == b"acct/"
+            ),
+            "the second writer saw a range that changed under it"
+        );
+        database.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn unprotected_scans_keep_plain_snapshot_isolation() {
+        let directory = tempdir().expect("tempdir");
+        let database = open_database(directory.path());
+
+        let mut first = database.begin().expect("begin first");
+        let mut second = database.begin().expect("begin second");
+        assert_eq!(first.scan_prefix(b"acct/").expect("scan").len(), 0);
+        assert_eq!(second.scan_prefix(b"acct/").expect("scan").len(), 0);
+        first.put(b"acct/1", b"one").expect("put first");
+        second.put(b"acct/2", b"two").expect("put second");
+
+        first.commit().expect("first commits");
+        second
+            .commit()
+            .expect("plain snapshot isolation admits the phantom");
+        database.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn protected_scans_ignore_writes_outside_their_range() {
+        let directory = tempdir().expect("tempdir");
+        let database = open_database(directory.path());
+
+        let mut protected = database.begin().expect("begin protected");
+        protected.protect_scans();
+        assert_eq!(protected.scan_prefix(b"acct/").expect("scan").len(), 0);
+        protected.put(b"acct/1", b"one").expect("put");
+
+        let mut unrelated = database.begin().expect("begin unrelated");
+        unrelated.put(b"other/9", b"noise").expect("put unrelated");
+        unrelated.commit().expect("commit unrelated");
+
+        protected
+            .commit()
+            .expect("writes outside the scanned range never conflict");
+        database.shutdown().expect("shutdown");
+    }
+
+    #[test]
     fn sequential_model_matches_committed_database_state() {
         let directory = tempdir().expect("tempdir");
         let database = open_database(directory.path());
@@ -1515,13 +1641,19 @@ mod tests {
 
         let first_timestamp = database
             .inner
-            .prepare_commit(first.id, first.snapshot, [b"same".to_vec()].into_iter())
+            .prepare_commit(
+                first.id,
+                first.snapshot,
+                [b"same".to_vec()].into_iter(),
+                &[],
+            )
             .expect("prepare first");
         assert!(matches!(
             database.inner.prepare_commit(
                 second.id,
                 second.snapshot,
-                [b"same".to_vec()].into_iter()
+                [b"same".to_vec()].into_iter(),
+                &[]
             ),
             Err(TransactionError::WriteConflict { .. })
         ));
@@ -1540,11 +1672,11 @@ mod tests {
         let second = database.begin().expect("second");
         let first_timestamp = database
             .inner
-            .prepare_commit(first.id, first.snapshot, [b"a".to_vec()].into_iter())
+            .prepare_commit(first.id, first.snapshot, [b"a".to_vec()].into_iter(), &[])
             .expect("prepare first");
         let second_timestamp = database
             .inner
-            .prepare_commit(second.id, second.snapshot, [b"b".to_vec()].into_iter())
+            .prepare_commit(second.id, second.snapshot, [b"b".to_vec()].into_iter(), &[])
             .expect("prepare second");
 
         database

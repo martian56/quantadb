@@ -63,15 +63,17 @@ the commit coordinator triggers automatically on a size budget.
 
 - MVCC and snapshot isolation — implemented for durable byte keys
 - Atomic commit and rollback — implemented
-- Concurrent B+ tree indexes — immutable persistent generations and
-  copy-on-write checkpoint deltas implemented; per-commit publication remains
-- Deadlock/conflict handling — immediate first-committer-wins conflicts
-- Model-based concurrency testing — sequential model implemented; concurrent
-  history checking remains
+- Concurrent B+ tree indexes — immutable persistent generations with online
+  copy-on-write publication after every commit
+- Deadlock/conflict handling — immediate first-committer-wins conflicts for
+  point writes, and opt-in range conflicts for protected scans
+- Model-based concurrency testing — sequential model plus a seeded
+  concurrent history checker validating snapshot isolation
 
-The current MVCC map is reconstructed with a physical-page scan at restart.
-M3 is not complete until online index publication, range-conflict policy,
-version reclamation, and stronger concurrent model checking are implemented.
+M3 is complete: online index publication, version reclamation with the
+generation ring, opt-in range conflicts, and concurrent history checking
+are all implemented. The MVCC map is still reconstructed with a
+physical-page scan at restart, which M5's format-stability work revisits.
 
 ### M4: execution engine
 
