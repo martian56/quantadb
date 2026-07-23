@@ -377,7 +377,11 @@ impl Inner {
         };
 
         let plan = if let Some(generation) = base_generation {
-            BPlusTree::edit_plan(&self.storage, generation.root, mutations.unwrap_or_default())?
+            BPlusTree::edit_plan(
+                &self.storage,
+                generation.root,
+                mutations.unwrap_or_default(),
+            )?
         } else {
             BPlusTree::plan(&self.storage, live_entries.unwrap_or_default())?
         };
@@ -419,9 +423,7 @@ impl Inner {
         } = &mut *state;
         dirty_keys.retain(|key| {
             versions.get(key).is_some_and(|versions| {
-                versions
-                    .iter()
-                    .any(|version| version.timestamp > timestamp)
+                versions.iter().any(|version| version.timestamp > timestamp)
             })
         });
         Ok(IndexBuildResult { timestamp, root })
@@ -1002,6 +1004,125 @@ mod tests {
         let stats = database.stats().expect("stats");
         assert_eq!(stats.visible_through, Timestamp(8));
         assert!(stats.group_commit.groups < 8, "{stats:?}");
+    }
+
+    #[test]
+    fn online_publication_converges_without_checkpoints() {
+        let directory = tempdir().expect("tempdir");
+        let database = MvccDatabase::open(directory.path(), MvccOptions::default()).expect("open");
+        for round in 0..5_u64 {
+            let mut transaction = database.begin().expect("begin");
+            transaction
+                .put(format!("user:{round}").into_bytes(), round.to_be_bytes())
+                .expect("put");
+            transaction.commit().expect("commit");
+        }
+
+        wait_for_indexed_through(&database, Timestamp(5));
+        let stats = database.stats().expect("stats");
+        assert_eq!(stats.indexed_keys, 5);
+        assert_eq!(
+            database.get(b"user:3").expect("get"),
+            Some(3_u64.to_be_bytes().to_vec())
+        );
+        database.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn online_publication_covers_deletes_and_restart_catch_up() {
+        let directory = tempdir().expect("tempdir");
+        {
+            let database = open_database(directory.path());
+            let mut seed = database.begin().expect("begin seed");
+            seed.put(b"keep", b"kept").expect("put keep");
+            seed.put(b"drop", b"doomed").expect("put drop");
+            seed.commit().expect("commit seed");
+            database.rebuild_index().expect("rebuild");
+
+            let mut deletion = database.begin().expect("begin delete");
+            deletion.delete(b"drop").expect("delete");
+            deletion.commit().expect("commit delete");
+            assert_eq!(
+                database.stats().expect("stats").indexed_through,
+                Some(Timestamp(1)),
+                "offline database must not publish on its own"
+            );
+            database.shutdown().expect("shutdown");
+        }
+
+        let database =
+            MvccDatabase::open(directory.path(), MvccOptions::default()).expect("reopen");
+        wait_for_indexed_through(&database, Timestamp(2));
+        let stats = database.stats().expect("stats");
+        assert_eq!(stats.indexed_keys, 1);
+        assert_eq!(database.get(b"keep").expect("get"), Some(b"kept".to_vec()));
+        assert_eq!(database.get(b"drop").expect("get"), None);
+        database.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn older_generation_reads_merge_newer_versions() {
+        let directory = tempdir().expect("tempdir");
+        let database = open_database(directory.path());
+        let mut first = database.begin().expect("begin first");
+        first.put(b"row:1", b"one").expect("put");
+        first.commit().expect("commit first");
+        database.rebuild_index().expect("rebuild");
+
+        let mut second = database.begin().expect("begin second");
+        second.put(b"row:1", b"newer").expect("update");
+        second.put(b"row:2", b"two").expect("insert");
+        second.commit().expect("commit second");
+
+        let mut third = database.begin().expect("begin third");
+        third.delete(b"row:1").expect("delete");
+        third.commit().expect("commit third");
+
+        assert_eq!(
+            database.stats().expect("stats").indexed_through,
+            Some(Timestamp(1)),
+            "generation must lag the snapshot for this test to mean anything"
+        );
+        assert_eq!(database.get(b"row:1").expect("get"), None);
+        assert_eq!(database.get(b"row:2").expect("get"), Some(b"two".to_vec()));
+        let transaction = database.begin().expect("begin scan");
+        assert_eq!(
+            transaction.scan_prefix(b"row:").expect("scan"),
+            vec![(b"row:2".to_vec(), b"two".to_vec())]
+        );
+        transaction.rollback().expect("rollback");
+        database.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn concurrent_commits_converge_online() {
+        let directory = tempdir().expect("tempdir");
+        let database = MvccDatabase::open(directory.path(), MvccOptions::default()).expect("open");
+
+        thread::scope(|scope| {
+            for worker in 0..4_u64 {
+                let database = &database;
+                scope.spawn(move || {
+                    for round in 0..4_u64 {
+                        let mut transaction = database.begin().expect("begin");
+                        let key = format!("w{worker}:r{round}").into_bytes();
+                        transaction.put(key, round.to_be_bytes()).expect("put");
+                        transaction.commit().expect("commit");
+                    }
+                });
+            }
+        });
+
+        let visible = database.stats().expect("stats").visible_through;
+        assert_eq!(visible, Timestamp(16));
+        wait_for_indexed_through(&database, visible);
+        let stats = database.stats().expect("stats");
+        assert_eq!(stats.indexed_keys, 16);
+        assert_eq!(
+            database.get(b"w2:r3").expect("get"),
+            Some(3_u64.to_be_bytes().to_vec())
+        );
+        database.shutdown().expect("shutdown");
     }
 
     #[test]
