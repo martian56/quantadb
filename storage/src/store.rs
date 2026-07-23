@@ -59,6 +59,65 @@ impl DirtyPages {
     }
 }
 
+/// Page ID allocation, separated from the store so reserving IDs never
+/// waits behind a commit batch's log sync.
+pub struct PageAllocator {
+    inner: std::sync::Mutex<AllocatorState>,
+}
+
+struct AllocatorState {
+    next_page_id: u64,
+    free_pages: std::collections::BTreeSet<PageId>,
+}
+
+impl PageAllocator {
+    pub fn reserve(&self, count: usize) -> Result<Vec<PageId>> {
+        let mut state = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut page_ids = Vec::with_capacity(count);
+        while page_ids.len() < count {
+            let Some(reused) = state.free_pages.pop_first() else {
+                break;
+            };
+            page_ids.push(reused);
+        }
+        let fresh = u64::try_from(count - page_ids.len()).map_err(|_| {
+            StorageError::Configuration("page reservation count exceeds u64".to_owned())
+        })?;
+        let end = state
+            .next_page_id
+            .checked_add(fresh)
+            .ok_or_else(|| StorageError::Configuration("page ID space exhausted".to_owned()))?;
+        page_ids.extend((state.next_page_id..end).map(PageId));
+        state.next_page_id = end;
+        Ok(page_ids)
+    }
+
+    pub fn release(&self, pages: impl IntoIterator<Item = PageId>) -> Result<()> {
+        let mut state = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        for page_id in pages {
+            if page_id.0 < state.next_page_id {
+                state.free_pages.insert(page_id);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn free_page_count(&self) -> Result<usize> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .free_pages
+            .len())
+    }
+
+    fn note_written(&self, page_id: PageId) -> Result<()> {
+        let mut state = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        state.next_page_id = state.next_page_id.max(page_id.0.saturating_add(1));
+        Ok(())
+    }
+}
+
 /// A lock-free read path shared with the commit coordinator's handle.
 ///
 /// Reads consult the dirty table under a short read lock and fall back to
@@ -94,14 +153,13 @@ pub struct DurableStore {
     /// performs, so they stay in the dirty table too. Tracking the LSN
     /// catches pages overwritten by a newer commit after their flush.
     flushed: std::collections::HashMap<PageId, Lsn>,
-    next_page_id: u64,
-    /// Released page IDs waiting for reuse.
+    /// Shared page ID allocation and the free pool.
     ///
-    /// Purely in memory: a released page keeps its stale content until a
-    /// new write lands on it through the normal WAL path, so a crash before
-    /// reuse loses nothing and the releasing layer rediscovers the same
-    /// garbage on restart.
-    free_pages: std::collections::BTreeSet<PageId>,
+    /// Free pages are purely in memory: a released page keeps its stale
+    /// content until a new write lands on it through the normal WAL path,
+    /// so a crash before reuse loses nothing and the releasing layer
+    /// rediscovers the same garbage on restart.
+    allocator: std::sync::Arc<PageAllocator>,
     poisoned: bool,
     _lock: StoreLock,
 }
@@ -137,15 +195,25 @@ impl DurableStore {
                 pages: std::sync::RwLock::new(std::collections::HashMap::new()),
             }),
             flushed: std::collections::HashMap::new(),
-            next_page_id: 0,
-            free_pages: std::collections::BTreeSet::new(),
+            allocator: std::sync::Arc::new(PageAllocator {
+                inner: std::sync::Mutex::new(AllocatorState {
+                    next_page_id: 0,
+                    free_pages: std::collections::BTreeSet::new(),
+                }),
+            }),
             poisoned: false,
             _lock: lock,
         };
         store.recover()?;
         let maximum_page_lsn = store.data.max_lsn()?;
         store.wal.ensure_next_lsn_after(maximum_page_lsn)?;
-        store.next_page_id = store.calculate_next_page_id()?;
+        let next_page_id = store.calculate_next_page_id()?;
+        store
+            .allocator
+            .inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .next_page_id = next_page_id;
         store.wal.trim_records_to_last_checkpoint();
         Ok(store)
     }
@@ -156,13 +224,13 @@ impl DurableStore {
     }
 
     pub fn allocate_page(&mut self, payload: impl Into<Vec<u8>>) -> Result<PageId> {
-        let page_id = PageId(self.next_page_id);
-        let following_page_id = self
-            .next_page_id
-            .checked_add(1)
+        let page_id = self
+            .allocator
+            .reserve(1)?
+            .into_iter()
+            .next()
             .ok_or_else(|| StorageError::Configuration("page ID space exhausted".to_owned()))?;
         self.write_page(page_id, payload)?;
-        self.next_page_id = self.next_page_id.max(following_page_id);
         Ok(page_id)
     }
 
@@ -252,23 +320,13 @@ impl DurableStore {
         if self.poisoned {
             return Err(StorageError::Poisoned);
         }
-        let mut page_ids = Vec::with_capacity(count);
-        while page_ids.len() < count {
-            let Some(reused) = self.free_pages.pop_first() else {
-                break;
-            };
-            page_ids.push(reused);
-        }
-        let fresh = u64::try_from(count - page_ids.len()).map_err(|_| {
-            StorageError::Configuration("page reservation count exceeds u64".to_owned())
-        })?;
-        let end = self
-            .next_page_id
-            .checked_add(fresh)
-            .ok_or_else(|| StorageError::Configuration("page ID space exhausted".to_owned()))?;
-        page_ids.extend((self.next_page_id..end).map(PageId));
-        self.next_page_id = end;
-        Ok(page_ids)
+        self.allocator.reserve(count)
+    }
+
+    /// The shared allocator, for callers that must never wait on the
+    /// store mutex a committing batch holds across its log sync.
+    pub fn page_allocator(&self) -> std::sync::Arc<PageAllocator> {
+        std::sync::Arc::clone(&self.allocator)
     }
 
     /// Return pages to the free pool for reuse by later reservations.
@@ -276,17 +334,12 @@ impl DurableStore {
     /// The caller vouches that nothing can reference these pages anymore.
     /// Their stale content stays on disk until a new write overwrites it,
     /// which keeps the release itself crash-free by construction.
-    pub fn release_pages(&mut self, pages: impl IntoIterator<Item = PageId>) {
-        for page_id in pages {
-            if page_id.0 < self.next_page_id {
-                self.free_pages.insert(page_id);
-            }
-        }
+    pub fn release_pages(&mut self, pages: impl IntoIterator<Item = PageId>) -> Result<()> {
+        self.allocator.release(pages)
     }
 
-    #[must_use]
-    pub fn free_page_count(&self) -> usize {
-        self.free_pages.len()
+    pub fn free_page_count(&self) -> Result<usize> {
+        self.allocator.free_page_count()
     }
 
     /// Establish a recovery boundary after all preceding data pages are synced.
@@ -319,7 +372,7 @@ impl DurableStore {
         for (write, lsn) in writes.iter().zip(&lsns) {
             let page = Page::with_lsn(write.page_id, *lsn, write.payload.clone())?;
             dirty.insert(write.page_id, page);
-            self.next_page_id = self.next_page_id.max(write.page_id.0.saturating_add(1));
+            self.allocator.note_written(write.page_id)?;
         }
         Ok(lsns)
     }
@@ -765,8 +818,8 @@ mod tests {
         for fill in 0..3_u8 {
             store.allocate_page(vec![fill; 8]).expect("allocate");
         }
-        store.release_pages([PageId(1)]);
-        assert_eq!(store.free_page_count(), 1);
+        store.release_pages([PageId(1)]).expect("release");
+        assert_eq!(store.free_page_count().expect("count"), 1);
 
         let reserved = store.reserve_page_ids(2).expect("reserve");
         assert_eq!(
@@ -774,7 +827,7 @@ mod tests {
             vec![PageId(1), PageId(3)],
             "the released page comes back first, then a fresh one"
         );
-        assert_eq!(store.free_page_count(), 0);
+        assert_eq!(store.free_page_count().expect("count"), 0);
 
         store
             .write_page(PageId(1), b"reused".to_vec())
