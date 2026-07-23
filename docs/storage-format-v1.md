@@ -6,19 +6,21 @@ releases.
 
 ## Durability invariant
 
-For every page write:
+For every commit batch:
 
 1. validate every page image;
 2. append physical page-image records to the WAL;
 3. append a batch-commit record containing the page count;
 4. synchronize the WAL;
-5. write the corresponding data pages;
-6. synchronize the data file.
+5. keep the committed pages in the in-memory dirty table.
 
-Grouped page writes share steps 4 and 6. A data page is never intentionally
-written before its WAL record and batch commit are durable. Recovery ignores
-page images without a following commit and replays every page from a committed
-batch, preventing prefix commits.
+One synchronized file per commit. The dirty table serves reads until a
+checkpoint writes those pages to the data file, synchronizes it, and only
+then truncates the log that protects them. A data page is therefore never
+on disk without its WAL images having been durable first, and a crash at
+any moment loses nothing: recovery ignores page images without a following
+commit and replays every page from a committed batch, preventing prefix
+commits.
 
 ## Data pages
 
@@ -78,8 +80,10 @@ checkpoint remains visible unless a newer WAL image can repair it.
 
 ## Checkpoints
 
-A checkpoint synchronizes the data file, appends a checkpoint record,
-synchronizes the log, and then truncates the log to zero bytes. An empty
+A checkpoint writes every dirty page to the data file, synchronizes it,
+appends a checkpoint record, synchronizes the log, and then truncates the
+log to zero bytes. Dirty pages leave memory only after that sequence, so
+concurrent readers always find each page in the table or the synced file. An empty
 log and a log ending in a checkpoint recover identically, so truncation is
 safe at any moment after the checkpoint record is durable, including
 across a crash between the two steps. LSN allocation resumes from the
@@ -92,8 +96,8 @@ so no commit waits on a checkpoint its own batch triggered.
 ## Current limitations
 
 - Page images are physical rather than physiological records.
-- The cache is bounded LRU and write-through; transaction-aware dirty-page
-  management and asynchronous flushing remain future work.
+- Dirty pages flush only at checkpoints; a background flusher that paces
+  the checkpoint's write burst remains future work.
 - A bounded background coordinator combines concurrent callers into shared
   sync groups. The MVCC layer now adds commit timestamps and publishes versions
   only after the coordinator confirms durability.

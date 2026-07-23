@@ -1,4 +1,7 @@
-use crate::{DurableStore, Lsn, Page, PageId, PageWrite, Result, StorageError, MAX_PAGE_PAYLOAD};
+use crate::{
+    store::SharedReader, DurableStore, Lsn, Page, PageId, PageWrite, Result, StorageError,
+    MAX_PAGE_PAYLOAD,
+};
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -101,12 +104,14 @@ pub struct GroupCommitter {
 pub struct GroupCommitHandle {
     sender: SyncSender<Command>,
     store: Arc<Mutex<DurableStore>>,
+    reader: Arc<SharedReader>,
     stats: Arc<AtomicStats>,
 }
 
 impl GroupCommitter {
     pub fn start(store: DurableStore, options: GroupCommitOptions) -> Result<Self> {
         let options = options.validate()?;
+        let reader = Arc::new(store.shared_reader()?);
         let store = Arc::new(Mutex::new(store));
         let stats = Arc::new(AtomicStats::default());
         let (sender, receiver) = mpsc::sync_channel(options.queue_depth);
@@ -120,6 +125,7 @@ impl GroupCommitter {
             handle: GroupCommitHandle {
                 sender,
                 store,
+                reader,
                 stats,
             },
             worker: Some(worker),
@@ -186,11 +192,13 @@ impl GroupCommitHandle {
             .map_err(|_| StorageError::CommitCoordinatorStopped)?
     }
 
+    /// Read a page without touching the store mutex.
+    ///
+    /// Commits hold that mutex across their WAL sync; readers coming
+    /// through here check the dirty table and the data file directly, so a
+    /// read never waits milliseconds for someone else's fsync.
     pub fn read_page(&self, page_id: PageId) -> Result<Option<Page>> {
-        self.store
-            .lock()
-            .map_err(|_| StorageError::GroupCommit("store mutex is poisoned".to_owned()))?
-            .read_page(page_id)
+        self.reader.read_page(page_id)
     }
 
     pub fn reserve_page_ids(&self, count: usize) -> Result<Vec<PageId>> {

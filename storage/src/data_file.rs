@@ -1,7 +1,7 @@
 use crate::{page::PAGE_SIZE, Page, PageId, Result, StorageError};
 use std::{
     fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Seek, SeekFrom},
     path::Path,
 };
 
@@ -30,32 +30,22 @@ impl DataFile {
     }
 
     pub(crate) fn read(&mut self, page_id: PageId) -> Result<Option<Page>> {
-        let offset = page_offset(page_id)?;
-        let length = self.file.metadata()?.len();
-        if offset.saturating_add(PAGE_SIZE as u64) > length {
-            return Ok(None);
-        }
+        read_shared(&self.file, page_id)
+    }
 
-        self.file.seek(SeekFrom::Start(offset))?;
-        let mut bytes = [0_u8; PAGE_SIZE];
-        self.file.read_exact(&mut bytes)?;
-        if bytes.iter().all(|byte| *byte == 0) {
-            return Ok(None);
-        }
-        let page = Page::decode(&bytes)?;
-        if page.id() != page_id {
-            return Err(StorageError::CorruptPage {
-                page_id,
-                reason: format!("page header contains ID {}", page.id()),
-            });
-        }
-        Ok(Some(page))
+    /// A second handle onto the same file for positional reads.
+    ///
+    /// Positional reads never depend on the shared cursor, and every writer
+    /// in this module seeks explicitly before writing, so readers on the
+    /// shared handle cannot disturb them.
+    pub(crate) fn share(&self) -> Result<File> {
+        Ok(self.file.try_clone()?)
     }
 
     pub(crate) fn write(&mut self, page: &Page) -> Result<()> {
-        self.file.seek(SeekFrom::Start(page_offset(page.id())?))?;
-        self.file.write_all(&page.encode())?;
-        Ok(())
+        // Positional writes only: the shared read handle moves the common
+        // cursor on some platforms, so nothing here may depend on it.
+        write_all_at(&self.file, &page.encode(), page_offset(page.id())?)
     }
 
     pub(crate) fn sync(&self) -> Result<()> {
@@ -76,6 +66,75 @@ impl DataFile {
         }
         Ok(maximum)
     }
+}
+
+/// Read one page at its offset without using the shared cursor.
+pub(crate) fn read_shared(file: &File, page_id: PageId) -> Result<Option<Page>> {
+    let offset = page_offset(page_id)?;
+    let length = file.metadata()?.len();
+    if offset.saturating_add(PAGE_SIZE as u64) > length {
+        return Ok(None);
+    }
+
+    let mut bytes = [0_u8; PAGE_SIZE];
+    read_exact_at(file, &mut bytes, offset)?;
+    if bytes.iter().all(|byte| *byte == 0) {
+        return Ok(None);
+    }
+    let page = Page::decode(&bytes)?;
+    if page.id() != page_id {
+        return Err(StorageError::CorruptPage {
+            page_id,
+            reason: format!("page header contains ID {}", page.id()),
+        });
+    }
+    Ok(Some(page))
+}
+
+#[cfg(windows)]
+fn write_all_at(file: &File, buffer: &[u8], offset: u64) -> Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut written = 0_usize;
+    while written < buffer.len() {
+        let count = file.seek_write(&buffer[written..], offset + written as u64)?;
+        if count == 0 {
+            return Err(StorageError::CorruptDataFile(
+                "page write made no progress".to_owned(),
+            ));
+        }
+        written += count;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_all_at(file: &File, buffer: &[u8], offset: u64) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.write_all_at(buffer, offset)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut filled = 0_usize;
+    while filled < buffer.len() {
+        let read = file.seek_read(&mut buffer[filled..], offset + filled as u64)?;
+        if read == 0 {
+            return Err(StorageError::CorruptDataFile(
+                "page read ended before the page did".to_owned(),
+            ));
+        }
+        filled += read;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buffer, offset)?;
+    Ok(())
 }
 
 fn page_offset(page_id: PageId) -> Result<u64> {
