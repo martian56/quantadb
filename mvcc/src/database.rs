@@ -58,6 +58,7 @@ pub struct MvccStats {
     pub indexed_through: Option<Timestamp>,
     pub index_height: Option<u16>,
     pub indexed_keys: u64,
+    pub reclaimed_versions: u64,
     pub index_cache: NodeCacheStats,
     pub group_commit: GroupCommitStats,
 }
@@ -86,6 +87,53 @@ struct State {
     index_generation: Option<IndexGeneration>,
     /// Keys with committed versions the published generation may not cover.
     dirty_keys: BTreeSet<Vec<u8>>,
+    /// Cumulative count of versions dropped from memory by reclamation.
+    reclaimed_versions: u64,
+}
+
+impl State {
+    /// Drop versions no active or future snapshot can observe.
+    ///
+    /// The horizon is the oldest active snapshot capped by the published
+    /// generation. Every version above the horizon survives. Below it, only
+    /// the newest version of each key survives, and even that one goes when
+    /// the generation fully covers the key: live values are served by the
+    /// index fall-through and deleted keys are simply absent from it. Keys
+    /// with pending intents or unpublished commits are never removed.
+    fn reclaim_covered(&mut self) {
+        let Some(generation) = self.index_generation else {
+            return;
+        };
+        let oldest_active = self
+            .active
+            .values()
+            .min()
+            .copied()
+            .unwrap_or(self.visible_through);
+        let horizon = oldest_active.min(generation.timestamp);
+        let Self {
+            versions,
+            intents,
+            dirty_keys,
+            reclaimed_versions,
+            ..
+        } = self;
+        versions.retain(|key, key_versions| {
+            if let Some(newest_covered) = key_versions
+                .iter()
+                .rposition(|version| version.timestamp <= horizon)
+            {
+                key_versions.drain(..newest_covered);
+                *reclaimed_versions += newest_covered as u64;
+            }
+            let fully_covered = key_versions.len() == 1 && key_versions[0].timestamp <= horizon;
+            if fully_covered && !dirty_keys.contains(key) && !intents.contains_key(key) {
+                *reclaimed_versions += 1;
+                return false;
+            }
+            true
+        });
+    }
 }
 
 #[derive(Default)]
@@ -183,18 +231,21 @@ impl MvccDatabase {
             .map(|(key, _)| key.clone())
             .collect();
         let needs_catch_up = !dirty_keys.is_empty();
+        let mut state = State {
+            versions,
+            intents: HashMap::new(),
+            active: HashMap::new(),
+            completed_timestamps: BTreeSet::new(),
+            next_transaction_id: 1,
+            next_commit_timestamp,
+            visible_through: Timestamp(maximum_timestamp),
+            index_generation,
+            dirty_keys,
+            reclaimed_versions: 0,
+        };
+        state.reclaim_covered();
         let inner = Arc::new(Inner {
-            state: Mutex::new(State {
-                versions,
-                intents: HashMap::new(),
-                active: HashMap::new(),
-                completed_timestamps: BTreeSet::new(),
-                next_transaction_id: 1,
-                next_commit_timestamp,
-                visible_through: Timestamp(maximum_timestamp),
-                index_generation,
-                dirty_keys,
-            }),
+            state: Mutex::new(state),
             storage,
             node_cache: NodeCache::new(options.index_cache_bytes),
             publish_signal: Mutex::new(PublishSignal::default()),
@@ -269,6 +320,7 @@ impl MvccDatabase {
                 .index_generation
                 .and_then(|generation| generation.root)
                 .map_or(0, |root| root.entries),
+            reclaimed_versions: state.reclaimed_versions,
             index_cache: self.inner.node_cache.stats(),
             group_commit: self.inner.storage.stats(),
         })
@@ -434,6 +486,7 @@ impl Inner {
                 versions.iter().any(|version| version.timestamp > timestamp)
             })
         });
+        state.reclaim_covered();
         Ok(IndexBuildResult { timestamp, root })
     }
 
@@ -1132,6 +1185,133 @@ mod tests {
             database.get(b"w2:r3").expect("get"),
             Some(3_u64.to_be_bytes().to_vec())
         );
+        database.shutdown().expect("shutdown");
+    }
+
+    fn wait_for_map_keys(database: &MvccDatabase, target: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let stats = database.stats().expect("stats");
+            if stats.keys == target {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reclamation stalled with {} keys in the map, wanted {target}",
+                stats.keys
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn cold_keys_leave_the_version_map_and_read_from_the_index() {
+        let directory = tempdir().expect("tempdir");
+        let database = MvccDatabase::open(directory.path(), MvccOptions::default()).expect("open");
+        for round in 0..20_u64 {
+            let mut transaction = database.begin().expect("begin");
+            transaction
+                .put(format!("cold:{round:02}").into_bytes(), round.to_be_bytes())
+                .expect("put");
+            transaction.commit().expect("commit");
+        }
+
+        wait_for_indexed_through(&database, Timestamp(20));
+        wait_for_map_keys(&database, 0);
+        let stats = database.stats().expect("stats");
+        assert_eq!(stats.versions, 0, "no version history should stay resident");
+        assert!(stats.reclaimed_versions >= 20, "{stats:?}");
+        assert_eq!(stats.indexed_keys, 20);
+
+        assert_eq!(
+            database.get(b"cold:07").expect("get"),
+            Some(7_u64.to_be_bytes().to_vec())
+        );
+        let transaction = database.begin().expect("begin");
+        let scanned = transaction.scan_prefix(b"cold:").expect("scan");
+        assert_eq!(scanned.len(), 20);
+        assert_eq!(scanned[3].0, b"cold:03".to_vec());
+        transaction.rollback().expect("rollback");
+        database.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn active_snapshots_pin_the_versions_they_can_see() {
+        let directory = tempdir().expect("tempdir");
+        let database = MvccDatabase::open(directory.path(), MvccOptions::default()).expect("open");
+        let mut seed = database.begin().expect("begin seed");
+        seed.put(b"pinned", b"first").expect("put");
+        seed.commit().expect("commit seed");
+
+        let reader = database.begin().expect("begin reader");
+        assert_eq!(reader.get(b"pinned").expect("get"), Some(b"first".to_vec()));
+
+        for value in [b"second".as_slice(), b"third".as_slice()] {
+            let mut writer = database.begin().expect("begin writer");
+            writer.put(b"pinned", value).expect("put");
+            writer.commit().expect("commit");
+        }
+        wait_for_indexed_through(&database, Timestamp(3));
+
+        let stats = database.stats().expect("stats");
+        assert!(
+            stats.versions >= 2,
+            "the reader's snapshot must pin old history: {stats:?}"
+        );
+        assert_eq!(
+            reader.get(b"pinned").expect("pinned read"),
+            Some(b"first".to_vec()),
+            "reclamation must never change what an open snapshot sees"
+        );
+        reader.rollback().expect("rollback reader");
+
+        let mut unblock = database.begin().expect("begin unblock");
+        unblock.put(b"other", b"value").expect("put");
+        unblock.commit().expect("commit unblock");
+        wait_for_indexed_through(&database, Timestamp(4));
+        wait_for_map_keys(&database, 0);
+        assert_eq!(
+            database.get(b"pinned").expect("get"),
+            Some(b"third".to_vec())
+        );
+        database.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn tombstones_are_reclaimed_and_stay_dead_after_restart() {
+        let directory = tempdir().expect("tempdir");
+        {
+            let database =
+                MvccDatabase::open(directory.path(), MvccOptions::default()).expect("open");
+            let mut seed = database.begin().expect("begin seed");
+            seed.put(b"keep", b"kept").expect("put keep");
+            seed.put(b"gone", b"doomed").expect("put gone");
+            seed.commit().expect("commit seed");
+            let mut deletion = database.begin().expect("begin delete");
+            deletion.delete(b"gone").expect("delete");
+            deletion.commit().expect("commit delete");
+
+            wait_for_indexed_through(&database, Timestamp(2));
+            wait_for_map_keys(&database, 0);
+            assert_eq!(database.get(b"gone").expect("get"), None);
+            database.shutdown().expect("shutdown");
+        }
+
+        let database =
+            MvccDatabase::open(directory.path(), MvccOptions::default()).expect("reopen");
+        let stats = database.stats().expect("stats");
+        assert_eq!(
+            stats.keys, 0,
+            "the open sweep must trim everything the page scan resurrected"
+        );
+        assert_eq!(database.get(b"gone").expect("get"), None);
+        assert_eq!(database.get(b"keep").expect("get"), Some(b"kept".to_vec()));
+        let transaction = database.begin().expect("begin");
+        assert_eq!(
+            transaction.scan_prefix(b"").expect("scan"),
+            vec![(b"keep".to_vec(), b"kept".to_vec())]
+        );
+        transaction.rollback().expect("rollback");
         database.shutdown().expect("shutdown");
     }
 
