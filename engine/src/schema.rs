@@ -34,6 +34,22 @@ pub struct TableSchema {
     pub next_row_id: u64,
 }
 
+/// Catalog metadata for one secondary index.
+///
+/// Column positions refer to the owning table's schema. Rows with a NULL in
+/// any indexed column are not indexed, so a unique index never treats two
+/// NULLs as a conflict and equality lookups, which never match NULL, stay
+/// correct.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexSchema {
+    pub format_version: u16,
+    pub id: u64,
+    pub name: String,
+    pub table_id: u64,
+    pub columns: Vec<usize>,
+    pub unique: bool,
+}
+
 impl TableSchema {
     pub fn from_create(id: u64, create: &CreateTable) -> Result<Self> {
         let columns = create

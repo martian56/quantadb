@@ -1,10 +1,13 @@
-use crate::{EngineError, Result, TableSchema, Value};
+use crate::{schema::IndexSchema, EngineError, Result, TableSchema, Value};
 use serde::{Deserialize, Serialize};
 
 const CATALOG_PREFIX: &[u8] = b"\0quanta/catalog/table/";
+const INDEX_CATALOG_PREFIX: &[u8] = b"\0quanta/catalog/index/";
 const ROW_PREFIX: &[u8] = b"\0quanta/row/";
 const UNIQUE_PREFIX: &[u8] = b"\0quanta/unique/";
+const INDEX_ENTRY_PREFIX: &[u8] = b"\0quanta/index/";
 const TABLE_ID_COUNTER_KEY: &[u8] = b"\0quanta/catalog/next_table_id";
+const INDEX_ID_COUNTER_KEY: &[u8] = b"\0quanta/catalog/next_index_id";
 const ROW_FORMAT_VERSION: u16 = 1;
 
 #[derive(Serialize, Deserialize)]
@@ -19,6 +22,77 @@ pub(crate) fn table_id_counter_key() -> &'static [u8] {
 
 pub(crate) fn catalog_key(name: &str) -> Result<Vec<u8>> {
     component_key(CATALOG_PREFIX, name.as_bytes())
+}
+
+pub(crate) fn index_id_counter_key() -> &'static [u8] {
+    INDEX_ID_COUNTER_KEY
+}
+
+pub(crate) fn index_catalog_key(name: &str) -> Result<Vec<u8>> {
+    component_key(INDEX_CATALOG_PREFIX, name.as_bytes())
+}
+
+pub(crate) fn index_catalog_prefix() -> &'static [u8] {
+    INDEX_CATALOG_PREFIX
+}
+
+pub(crate) fn index_entry_prefix(index_id: u64) -> Vec<u8> {
+    let mut key = INDEX_ENTRY_PREFIX.to_vec();
+    key.extend_from_slice(&index_id.to_be_bytes());
+    key
+}
+
+/// The entry key prefix shared by every row with these indexed values.
+///
+/// Each value is length delimited so multi-column boundaries are
+/// unambiguous, and a shorter column list is a strict byte prefix of a
+/// longer one, which is what makes leading-column lookups work.
+pub(crate) fn index_value_prefix(index_id: u64, values: &[&Value]) -> Result<Vec<u8>> {
+    let mut key = index_entry_prefix(index_id);
+    for value in values {
+        let identity = encode_identity(value)?;
+        let length = u32::try_from(identity.len())
+            .map_err(|_| EngineError::InvalidRow("indexed value is too large".to_owned()))?;
+        key.extend_from_slice(&length.to_be_bytes());
+        key.extend_from_slice(&identity);
+    }
+    Ok(key)
+}
+
+/// The full entry key for one row in one index.
+///
+/// Unique indexes key on the values alone, so two rows with equal values
+/// collide inside a transaction and conflict across transactions. Regular
+/// indexes append the row key, so equal values coexist and an entry is
+/// removable without touching its neighbors.
+pub(crate) fn index_entry_key(
+    index: &IndexSchema,
+    values: &[&Value],
+    row_key: &[u8],
+) -> Result<Vec<u8>> {
+    let mut key = index_value_prefix(index.id, values)?;
+    if !index.unique {
+        let length = u32::try_from(row_key.len())
+            .map_err(|_| EngineError::InvalidRow("row key is too large".to_owned()))?;
+        key.extend_from_slice(&length.to_be_bytes());
+        key.extend_from_slice(row_key);
+    }
+    Ok(key)
+}
+
+pub(crate) fn encode_index(index: &IndexSchema) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec(index)?)
+}
+
+pub(crate) fn decode_index(bytes: &[u8]) -> Result<IndexSchema> {
+    let index: IndexSchema = serde_json::from_slice(bytes)?;
+    if index.format_version != 1 {
+        return Err(EngineError::CorruptRecord(format!(
+            "unsupported index format version {}",
+            index.format_version
+        )));
+    }
+    Ok(index)
 }
 
 pub(crate) fn row_prefix(table_id: u64) -> Vec<u8> {
