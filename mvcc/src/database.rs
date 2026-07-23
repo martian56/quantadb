@@ -1113,6 +1113,7 @@ mod tests {
                     queue_depth: 32,
                     max_batch_pages: 32,
                     max_delay: Duration::from_millis(25),
+                    ..GroupCommitOptions::default()
                 },
                 ..offline_options()
             },
