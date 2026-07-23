@@ -1,0 +1,19 @@
+[package]
+name = "quantadb-storage"
+description = "Durable page storage, WAL, recovery, and buffer pool for QuantaDB"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+crc32fast.workspace = true
+fs2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
