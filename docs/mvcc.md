@@ -84,8 +84,16 @@ a generation passes them, and the sweep at open keeps a restart from
 resurrecting reclaimed history. An open snapshot pins the history it can
 see, so reclamation waits for long readers rather than breaking them, and
 a reclaimed key that is later rewritten still serves its old value to old
-snapshots through the ring. Version pages on disk are not yet recycled;
-that needs free-page tracking in the storage layer.
+snapshots through the ring.
+
+Reclamation also returns pages to the store's free pool: a drained
+version's page and a pruned generation's manifest page are provably
+unreachable, so later reservations reuse them instead of growing the file.
+The pool is in-memory by design. A freed page keeps its stale bytes until
+a new write overwrites them through the log, so a crash before reuse loses
+nothing, and the sweep at open rediscovers the same pages as free.
+Copy-on-write index nodes are shared between generations and are not freed
+yet; that needs reachability tracking.
 
 ## Conflict behavior
 
@@ -111,7 +119,7 @@ serializable isolation remains future work.
 - Restart still discovers manifests and rebuilds version history by scanning
   physical pages.
 - Keys and values must fit together in one page payload.
-- Reclamation is in-memory only; version pages on disk wait on storage-level
-  free-page tracking.
+- Shared copy-on-write index nodes are never freed; reclaiming them needs
+  reachability tracking across generations.
 - There is no schema, catalog, secondary index, or SQL execution integration.
 - The on-disk MVCC format is internal and has no stable-upgrade promise yet.
