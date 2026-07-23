@@ -64,6 +64,27 @@ impl SqlSession {
         }
     }
 
+    /// Describe the result shape of one statement without executing it.
+    ///
+    /// Returns the output columns for a single SELECT and None for
+    /// everything else. Uses a read-only look at the catalog; no rows are
+    /// touched and no session state changes.
+    pub fn describe(&mut self, sql: &str) -> Result<Option<Vec<OutputColumn>>> {
+        let statements = parse_sql(sql)?;
+        let [Statement::Select(select)] = statements.as_slice() else {
+            return Ok(None);
+        };
+        if let SessionState::Active(transaction) = &self.state {
+            let schema = load_schema(transaction, &select.from.value)?;
+            return Ok(Some(projection_columns(&schema, &select.projection)?));
+        }
+        let transaction = self.engine.database.begin()?;
+        let schema = load_schema(&transaction, &select.from.value)?;
+        let columns = projection_columns(&schema, &select.projection)?;
+        transaction.rollback()?;
+        Ok(Some(columns))
+    }
+
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementOutput>> {
         let statements = match parse_sql(sql) {
             Ok(statements) => statements,
