@@ -153,6 +153,11 @@ pub struct DurableStore {
     /// performs, so they stay in the dirty table too. Tracking the LSN
     /// catches pages overwritten by a newer commit after their flush.
     flushed: std::collections::HashMap<PageId, Lsn>,
+    /// Pages awaiting their paced flush, in commit order.
+    ///
+    /// An explicit queue keeps each pacing step proportional to its budget
+    /// instead of rescanning the whole dirty table under the store mutex.
+    flush_queue: std::collections::VecDeque<PageId>,
     /// Shared page ID allocation and the free pool.
     ///
     /// Free pages are purely in memory: a released page keeps its stale
@@ -195,6 +200,7 @@ impl DurableStore {
                 pages: std::sync::RwLock::new(std::collections::HashMap::new()),
             }),
             flushed: std::collections::HashMap::new(),
+            flush_queue: std::collections::VecDeque::new(),
             allocator: std::sync::Arc::new(PageAllocator {
                 inner: std::sync::Mutex::new(AllocatorState {
                     next_page_id: 0,
@@ -372,6 +378,7 @@ impl DurableStore {
         for (write, lsn) in writes.iter().zip(&lsns) {
             let page = Page::with_lsn(write.page_id, *lsn, write.payload.clone())?;
             dirty.insert(write.page_id, page);
+            self.flush_queue.push_back(write.page_id);
             self.allocator.note_written(write.page_id)?;
         }
         Ok(lsns)
@@ -391,16 +398,24 @@ impl DurableStore {
                 .pages
                 .read()
                 .map_err(|_| StorageError::Poisoned)?;
-            dirty
-                .values()
-                .filter(|page| {
-                    self.flushed
-                        .get(&page.id())
-                        .is_none_or(|written| *written != page.lsn())
-                })
-                .take(budget)
-                .cloned()
-                .collect()
+            let mut pending = Vec::new();
+            while pending.len() < budget {
+                let Some(page_id) = self.flush_queue.pop_front() else {
+                    break;
+                };
+                let Some(page) = dirty.get(&page_id) else {
+                    continue;
+                };
+                if self
+                    .flushed
+                    .get(&page_id)
+                    .is_some_and(|written| *written == page.lsn())
+                {
+                    continue;
+                }
+                pending.push(page.clone());
+            }
+            pending
         };
         for page in &pending {
             self.data.write(page)?;
