@@ -31,7 +31,7 @@ Uncommitted catalog and row changes are invisible to other sessions.
 
 - `CREATE TABLE` and `DROP TABLE`
 - multi-row `INSERT`
-- `SELECT` projections, expressions, `WHERE`, and `LIMIT`
+- `SELECT` projections, expressions, `WHERE`, `ORDER BY`, and `LIMIT`
 - `UPDATE` expressions and predicates
 - `DELETE` predicates
 - transaction control
@@ -43,7 +43,7 @@ Uncommitted catalog and row changes are invisible to other sessions.
 ## Remaining work
 
 - secondary `CREATE INDEX` execution and catalog metadata
-- joins, grouping, ordering, parameters, and subqueries
+- joins, grouping, parameters, and subqueries
 - binder/planner separation and cost-based plans
 - non-unique secondary indexes and richer predicate/range planning
 - durable schema migrations and broader SQL types

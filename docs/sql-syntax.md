@@ -13,9 +13,13 @@ resolution, type checking, permissions, and execution belong to later layers.
 - `COMMIT [TRANSACTION | WORK]`
 - `ROLLBACK [TRANSACTION | WORK]`
 - `INSERT INTO ... [(columns)] VALUES ...`
-- `SELECT ... FROM ... [WHERE ...] [LIMIT ...]`
+- `SELECT ... FROM ... [WHERE ...] [ORDER BY key [ASC | DESC], ...] [LIMIT ...]`
 - `UPDATE ... SET ... [WHERE ...]`
 - `DELETE FROM ... [WHERE ...]`
+
+Order keys are full expressions and do not have to appear in the
+projection. Ascending order puts nulls last and descending puts them
+first. `LIMIT` applies after the sort.
 
 Supported column constraints are `PRIMARY KEY`, `NOT NULL`, `NULL`, and
 `UNIQUE`. Current scalar types are `BOOL`, `INT`/`BIGINT`, `FLOAT`/`DOUBLE`,
