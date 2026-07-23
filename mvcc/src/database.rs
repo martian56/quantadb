@@ -1,8 +1,8 @@
 use crate::{index_manifest::IndexGeneration, record::VersionRecord, Result, TransactionError};
 use quantadb_index::{BPlusTree, IndexEntry, IndexMutation, IndexRoot, NodeCache, NodeCacheStats};
 use quantadb_storage::{
-    DurableStore, GroupCommitHandle, GroupCommitOptions, GroupCommitStats, GroupCommitter, PageId,
-    PageWrite, StoreOptions,
+    ByteCacheStats, DurableStore, GroupCommitHandle, GroupCommitOptions, GroupCommitStats,
+    GroupCommitter, PageId, PageWrite, SharedByteLru, StoreOptions,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -29,6 +29,8 @@ pub struct MvccOptions {
     pub online_index: bool,
     /// Byte budget for the shared cache of decoded index nodes.
     pub index_cache_bytes: usize,
+    /// Byte budget for the shared cache of decoded version records.
+    pub record_cache_bytes: usize,
 }
 
 impl Default for MvccOptions {
@@ -38,6 +40,7 @@ impl Default for MvccOptions {
             group_commit: GroupCommitOptions::default(),
             online_index: true,
             index_cache_bytes: 64 << 20,
+            record_cache_bytes: 64 << 20,
         }
     }
 }
@@ -60,6 +63,7 @@ pub struct MvccStats {
     pub indexed_keys: u64,
     pub reclaimed_versions: u64,
     pub index_cache: NodeCacheStats,
+    pub record_cache: ByteCacheStats,
     pub group_commit: GroupCommitStats,
 }
 
@@ -146,6 +150,7 @@ struct Inner {
     state: Mutex<State>,
     storage: GroupCommitHandle,
     node_cache: NodeCache,
+    record_cache: SharedByteLru<VersionRecord>,
     publish_signal: Mutex<PublishSignal>,
     publish_wake: Condvar,
 }
@@ -248,6 +253,7 @@ impl MvccDatabase {
             state: Mutex::new(state),
             storage,
             node_cache: NodeCache::new(options.index_cache_bytes),
+            record_cache: SharedByteLru::new(options.record_cache_bytes),
             publish_signal: Mutex::new(PublishSignal::default()),
             publish_wake: Condvar::new(),
         });
@@ -322,6 +328,7 @@ impl MvccDatabase {
                 .map_or(0, |root| root.entries),
             reclaimed_versions: state.reclaimed_versions,
             index_cache: self.inner.node_cache.stats(),
+            record_cache: self.inner.record_cache.stats(),
             group_commit: self.inner.storage.stats(),
         })
     }
@@ -534,19 +541,27 @@ impl Inner {
         key: &[u8],
         snapshot: Timestamp,
     ) -> Result<Option<Vec<u8>>> {
-        let page =
-            self.storage
-                .read_page(page_id)?
-                .ok_or_else(|| TransactionError::CorruptRecord {
-                    page_id,
-                    reason: "index points to an absent version page".to_owned(),
+        let record = match self.record_cache.get(page_id) {
+            Some(record) => record,
+            None => {
+                let page = self.storage.read_page(page_id)?.ok_or_else(|| {
+                    TransactionError::CorruptRecord {
+                        page_id,
+                        reason: "index points to an absent version page".to_owned(),
+                    }
                 })?;
-        let record = VersionRecord::decode(page_id, page.payload())?.ok_or_else(|| {
-            TransactionError::CorruptRecord {
-                page_id,
-                reason: "index points to a non-MVCC page".to_owned(),
+                let record = VersionRecord::decode(page_id, page.payload())?.ok_or_else(|| {
+                    TransactionError::CorruptRecord {
+                        page_id,
+                        reason: "index points to a non-MVCC page".to_owned(),
+                    }
+                })?;
+                let record = Arc::new(record);
+                self.record_cache
+                    .insert(page_id, &record, record.approximate_bytes());
+                record
             }
-        })?;
+        };
         if record.key != key {
             return Err(TransactionError::CorruptRecord {
                 page_id,
@@ -559,7 +574,7 @@ impl Inner {
                 reason: "index points to a version that is not live in its snapshot".to_owned(),
             });
         }
-        Ok(record.value)
+        Ok(record.value.clone())
     }
 
     fn prepare_commit(
@@ -610,14 +625,20 @@ impl Inner {
             .iter()
             .zip(&page_ids)
             .map(|((key, value), page_id)| {
+                let record = VersionRecord {
+                    timestamp,
+                    key: key.clone(),
+                    value: value.clone(),
+                };
+                let payload = record.encode()?;
+                if record.value.is_some() {
+                    let record = Arc::new(record);
+                    self.record_cache
+                        .insert(*page_id, &record, record.approximate_bytes());
+                }
                 Ok(PageWrite {
                     page_id: *page_id,
-                    payload: VersionRecord {
-                        timestamp,
-                        key: key.clone(),
-                        value: value.clone(),
-                    }
-                    .encode()?,
+                    payload,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1232,6 +1253,12 @@ mod tests {
         assert_eq!(scanned.len(), 20);
         assert_eq!(scanned[3].0, b"cold:03".to_vec());
         transaction.rollback().expect("rollback");
+
+        let stats = database.stats().expect("stats");
+        assert!(
+            stats.record_cache.hits > 0,
+            "fall-through reads must be served from the record cache: {stats:?}"
+        );
         database.shutdown().expect("shutdown");
     }
 
