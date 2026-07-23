@@ -1,10 +1,11 @@
 //! A PostgreSQL v3 wire protocol frontend.
 //!
-//! This speaks the simple query protocol: startup, SSL negotiation, trust
-//! authentication, `Query`, transactions, and errors with SQLSTATEs. That is
-//! enough for psql and for drivers that do not use prepared statements. The
-//! extended query protocol is answered with a clear error until it is
-//! implemented.
+//! Speaks both query protocols. Simple: startup, SSL negotiation, trust
+//! authentication, `Query`, transactions, and errors with SQLSTATEs.
+//! Extended: Parse, Bind, Describe, Execute, Close, Flush, and Sync with
+//! text-format parameters, which covers prepared-statement drivers.
+//! Parameters substitute into the SQL as quoted literals before parsing;
+//! binary parameter format is refused with a clear error.
 //!
 //! Each accepted connection runs on a blocking thread with its own engine
 //! session, bounded by the shared connection limit. The engine is
@@ -83,6 +84,25 @@ where
     }
 }
 
+/// A named prepared statement: raw SQL plus its parameter count.
+struct Prepared {
+    sql: String,
+    parameters: usize,
+}
+
+/// A bound portal: SQL with every parameter already substituted.
+struct Portal {
+    sql: String,
+}
+
+#[derive(Default)]
+struct ExtendedState {
+    statements: std::collections::HashMap<String, Prepared>,
+    portals: std::collections::HashMap<String, Portal>,
+    /// After an error in an extended sequence, skip messages until Sync.
+    skip_until_sync: bool,
+}
+
 fn run_connection(socket: TcpStream, mut session: SqlSession) -> std::io::Result<()> {
     socket.set_nodelay(true).ok();
     let mut reader = BufReader::new(socket.try_clone()?);
@@ -91,6 +111,7 @@ fn run_connection(socket: TcpStream, mut session: SqlSession) -> std::io::Result
     if !handshake(&mut reader, &mut writer)? {
         return Ok(());
     }
+    let mut extended = ExtendedState::default();
 
     loop {
         let mut kind = [0_u8; 1];
@@ -105,27 +126,435 @@ fn run_connection(socket: TcpStream, mut session: SqlSession) -> std::io::Result
         let mut payload = vec![0_u8; (length - 4) as usize];
         reader.read_exact(&mut payload)?;
 
+        if extended.skip_until_sync && !matches!(kind[0], b'S' | b'X') {
+            continue;
+        }
+
         match kind[0] {
             b'Q' => {
                 let sql = cstring_at(&payload, 0).unwrap_or_default();
                 run_simple_query(&mut writer, &mut session, &sql)?;
             }
-            b'X' => return Ok(()),
+            b'P' => {
+                if let Err((code, message)) = handle_parse(&mut extended, &payload) {
+                    send_error(&mut writer, code, &message)?;
+                    extended.skip_until_sync = true;
+                } else {
+                    write_message(&mut writer, b'1', &[])?;
+                }
+            }
+            b'B' => {
+                if let Err((code, message)) = handle_bind(&mut extended, &payload) {
+                    send_error(&mut writer, code, &message)?;
+                    extended.skip_until_sync = true;
+                } else {
+                    write_message(&mut writer, b'2', &[])?;
+                }
+            }
+            b'D' => {
+                if let Err((code, message)) =
+                    handle_describe(&mut writer, &mut session, &extended, &payload)
+                {
+                    send_error(&mut writer, code, &message)?;
+                    extended.skip_until_sync = true;
+                }
+            }
+            b'E' => {
+                if let Err((code, message)) =
+                    handle_execute(&mut writer, &mut session, &extended, &payload)
+                {
+                    send_error(&mut writer, code, &message)?;
+                    extended.skip_until_sync = true;
+                }
+            }
+            b'C' => {
+                handle_close(&mut extended, &payload);
+                write_message(&mut writer, b'3', &[])?;
+            }
+            b'H' => {
+                writer.flush()?;
+            }
             b'S' => {
+                extended.skip_until_sync = false;
                 send_ready(&mut writer, &session)?;
             }
+            b'X' => return Ok(()),
             other => {
                 send_error(
                     &mut writer,
                     "0A000",
-                    &format!(
-                        "message '{}' is not supported yet; use the simple query protocol",
-                        char::from(other)
-                    ),
+                    &format!("message '{}' is not supported", char::from(other)),
                 )?;
                 send_ready(&mut writer, &session)?;
             }
         }
+    }
+}
+
+type ExtendedResult = std::result::Result<(), (&'static str, String)>;
+
+fn handle_parse(extended: &mut ExtendedState, payload: &[u8]) -> ExtendedResult {
+    let mut cursor = Cursor::new(payload);
+    let name = cursor.take_cstring()?;
+    let sql = cursor.take_cstring()?;
+    let parameters = count_parameters(&sql);
+    let declared = cursor.take_i16()?;
+    for _ in 0..declared {
+        cursor.take_i32()?;
+    }
+    extended
+        .statements
+        .insert(name, Prepared { sql, parameters });
+    Ok(())
+}
+
+fn handle_bind(extended: &mut ExtendedState, payload: &[u8]) -> ExtendedResult {
+    let mut cursor = Cursor::new(payload);
+    let portal_name = cursor.take_cstring()?;
+    let statement_name = cursor.take_cstring()?;
+    let Some(prepared) = extended.statements.get(&statement_name) else {
+        return Err((
+            "26000",
+            format!("prepared statement \"{statement_name}\" does not exist"),
+        ));
+    };
+
+    let format_count = cursor.take_i16()?;
+    let mut formats = Vec::with_capacity(format_count.max(0) as usize);
+    for _ in 0..format_count {
+        formats.push(cursor.take_i16()?);
+    }
+    let value_count = cursor.take_i16()? as usize;
+    if value_count != prepared.parameters {
+        return Err((
+            "08P01",
+            format!(
+                "bind supplies {value_count} parameters but the statement uses {}",
+                prepared.parameters
+            ),
+        ));
+    }
+
+    let mut literals = Vec::with_capacity(value_count);
+    for position in 0..value_count {
+        let format = match formats.len() {
+            0 => 0,
+            1 => formats[0],
+            _ => *formats.get(position).unwrap_or(&0),
+        };
+        if format != 0 {
+            return Err((
+                "0A000",
+                "binary parameter format is not supported yet; send text".to_owned(),
+            ));
+        }
+        let length = cursor.take_i32()?;
+        if length < 0 {
+            literals.push("NULL".to_owned());
+        } else {
+            let bytes = cursor.take_bytes(length as usize)?;
+            let text = String::from_utf8(bytes.to_vec())
+                .map_err(|_| ("22021", "parameter is not valid UTF-8".to_owned()))?;
+            literals.push(quote_literal(&text));
+        }
+    }
+
+    let sql = substitute_parameters(&prepared.sql, &literals)?;
+    extended.portals.insert(portal_name, Portal { sql });
+    Ok(())
+}
+
+fn handle_describe(
+    writer: &mut BufWriter<TcpStream>,
+    session: &mut SqlSession,
+    extended: &ExtendedState,
+    payload: &[u8],
+) -> ExtendedResult {
+    let mut cursor = Cursor::new(payload);
+    let target = cursor.take_u8()?;
+    let name = cursor.take_cstring()?;
+    let (sql, is_statement) = match target {
+        b'S' => {
+            let Some(prepared) = extended.statements.get(&name) else {
+                return Err((
+                    "26000",
+                    format!("prepared statement \"{name}\" does not exist"),
+                ));
+            };
+            let placeholders = vec!["NULL".to_owned(); prepared.parameters];
+            (substitute_parameters(&prepared.sql, &placeholders)?, true)
+        }
+        b'P' => {
+            let Some(portal) = extended.portals.get(&name) else {
+                return Err(("34000", format!("portal \"{name}\" does not exist")));
+            };
+            (portal.sql.clone(), false)
+        }
+        _ => return Err(("08P01", "describe target must be S or P".to_owned())),
+    };
+
+    if is_statement {
+        let prepared = extended
+            .statements
+            .get(&name)
+            .expect("checked above; describe target exists");
+        let mut body = Vec::new();
+        body.extend_from_slice(&(prepared.parameters as i16).to_be_bytes());
+        for _ in 0..prepared.parameters {
+            body.extend_from_slice(&OID_TEXT.to_be_bytes());
+        }
+        write_message(writer, b't', &body).map_err(io_to_extended)?;
+    }
+
+    match session.describe(&sql) {
+        Ok(Some(columns)) => {
+            write_row_description(writer, &columns).map_err(io_to_extended)?;
+        }
+        Ok(None) => {
+            write_message(writer, b'n', &[]).map_err(io_to_extended)?;
+        }
+        Err(error) => return Err((sqlstate(&error), error.to_string())),
+    }
+    Ok(())
+}
+
+fn handle_execute(
+    writer: &mut BufWriter<TcpStream>,
+    session: &mut SqlSession,
+    extended: &ExtendedState,
+    payload: &[u8],
+) -> ExtendedResult {
+    let mut cursor = Cursor::new(payload);
+    let name = cursor.take_cstring()?;
+    let Some(portal) = extended.portals.get(&name) else {
+        return Err(("34000", format!("portal \"{name}\" does not exist")));
+    };
+
+    match session.execute(&portal.sql) {
+        Ok(outputs) => {
+            for output in outputs {
+                write_output_rows_only(writer, output).map_err(io_to_extended)?;
+            }
+            Ok(())
+        }
+        Err(error) => Err((sqlstate(&error), error.to_string())),
+    }
+}
+
+fn handle_close(extended: &mut ExtendedState, payload: &[u8]) {
+    let mut cursor = Cursor::new(payload);
+    let Ok(target) = cursor.take_u8() else { return };
+    let Ok(name) = cursor.take_cstring() else {
+        return;
+    };
+    match target {
+        b'S' => {
+            extended.statements.remove(&name);
+        }
+        b'P' => {
+            extended.portals.remove(&name);
+        }
+        _ => {}
+    }
+}
+
+fn io_to_extended(error: std::io::Error) -> (&'static str, String) {
+    ("08006", error.to_string())
+}
+
+/// Count `$n` placeholders outside string literals and comments.
+fn count_parameters(sql: &str) -> usize {
+    scan_parameters(sql).into_iter().max().unwrap_or(0)
+}
+
+/// The distinct parameter numbers referenced by the statement.
+fn scan_parameters(sql: &str) -> Vec<usize> {
+    let mut numbers = Vec::new();
+    let bytes = sql.as_bytes();
+    let mut position = 0;
+    while position < bytes.len() {
+        match bytes[position] {
+            b'\'' => {
+                position += 1;
+                while position < bytes.len() {
+                    if bytes[position] == b'\'' {
+                        if bytes.get(position + 1) == Some(&b'\'') {
+                            position += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    position += 1;
+                }
+                position += 1;
+            }
+            b'-' if bytes.get(position + 1) == Some(&b'-') => {
+                while position < bytes.len() && bytes[position] != b'\n' {
+                    position += 1;
+                }
+            }
+            b'$' => {
+                let start = position + 1;
+                let mut end = start;
+                while end < bytes.len() && bytes[end].is_ascii_digit() {
+                    end += 1;
+                }
+                if end > start {
+                    if let Ok(number) = sql[start..end].parse::<usize>() {
+                        numbers.push(number);
+                    }
+                }
+                position = end.max(position + 1);
+                continue;
+            }
+            _ => position += 1,
+        }
+    }
+    numbers
+}
+
+/// Replace `$n` placeholders with pre-quoted literals, skipping strings
+/// and line comments so a `$1` inside quotes stays untouched.
+fn substitute_parameters(
+    sql: &str,
+    literals: &[String],
+) -> std::result::Result<String, (&'static str, String)> {
+    let bytes = sql.as_bytes();
+    let mut output = String::with_capacity(sql.len() + 16);
+    let mut position = 0;
+    while position < bytes.len() {
+        match bytes[position] {
+            b'\'' => {
+                let start = position;
+                position += 1;
+                while position < bytes.len() {
+                    if bytes[position] == b'\'' {
+                        if bytes.get(position + 1) == Some(&b'\'') {
+                            position += 2;
+                            continue;
+                        }
+                        position += 1;
+                        break;
+                    }
+                    position += 1;
+                }
+                output.push_str(&sql[start..position.min(bytes.len())]);
+            }
+            b'-' if bytes.get(position + 1) == Some(&b'-') => {
+                let start = position;
+                while position < bytes.len() && bytes[position] != b'\n' {
+                    position += 1;
+                }
+                output.push_str(&sql[start..position]);
+            }
+            b'$' => {
+                let digits_start = position + 1;
+                let mut digits_end = digits_start;
+                while digits_end < bytes.len() && bytes[digits_end].is_ascii_digit() {
+                    digits_end += 1;
+                }
+                if digits_end == digits_start {
+                    output.push('$');
+                    position += 1;
+                    continue;
+                }
+                let number: usize = sql[digits_start..digits_end]
+                    .parse()
+                    .map_err(|_| ("08P01", "parameter number is out of range".to_owned()))?;
+                let literal = number
+                    .checked_sub(1)
+                    .and_then(|index| literals.get(index))
+                    .ok_or_else(|| {
+                        (
+                            "08P01",
+                            format!(
+                                "statement references ${number} but only {} parameters are bound",
+                                literals.len()
+                            ),
+                        )
+                    })?;
+                output.push_str(literal);
+                position = digits_end;
+            }
+            other => {
+                output.push(char::from(other));
+                position += 1;
+            }
+        }
+    }
+    Ok(output)
+}
+
+/// Quote a text parameter as a SQL literal, doubling embedded quotes.
+fn quote_literal(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('\'');
+    for character in text.chars() {
+        if character == '\'' {
+            quoted.push('\'');
+        }
+        quoted.push(character);
+    }
+    quoted.push('\'');
+    quoted
+}
+
+struct Cursor<'a> {
+    payload: &'a [u8],
+    position: usize,
+}
+
+impl<'a> Cursor<'a> {
+    const fn new(payload: &'a [u8]) -> Self {
+        Self {
+            payload,
+            position: 0,
+        }
+    }
+
+    fn take_u8(&mut self) -> std::result::Result<u8, (&'static str, String)> {
+        let byte = *self
+            .payload
+            .get(self.position)
+            .ok_or(("08P01", "message is truncated".to_owned()))?;
+        self.position += 1;
+        Ok(byte)
+    }
+
+    fn take_i16(&mut self) -> std::result::Result<i16, (&'static str, String)> {
+        let bytes = self.take_bytes(2)?;
+        Ok(i16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn take_i32(&mut self) -> std::result::Result<i32, (&'static str, String)> {
+        let bytes = self.take_bytes(4)?;
+        Ok(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn take_bytes(
+        &mut self,
+        count: usize,
+    ) -> std::result::Result<&'a [u8], (&'static str, String)> {
+        let end = self
+            .position
+            .checked_add(count)
+            .filter(|end| *end <= self.payload.len())
+            .ok_or(("08P01", "message is truncated".to_owned()))?;
+        let bytes = &self.payload[self.position..end];
+        self.position = end;
+        Ok(bytes)
+    }
+
+    fn take_cstring(&mut self) -> std::result::Result<String, (&'static str, String)> {
+        let start = self.position;
+        let relative = self.payload[start..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or(("08P01", "unterminated string in message".to_owned()))?;
+        let end = start + relative;
+        self.position = end + 1;
+        String::from_utf8(self.payload[start..end].to_vec())
+            .map_err(|_| ("22021", "string is not valid UTF-8".to_owned()))
     }
 }
 
@@ -200,6 +629,37 @@ fn run_simple_query(
 }
 
 fn write_output(writer: &mut BufWriter<TcpStream>, output: StatementOutput) -> std::io::Result<()> {
+    if let StatementOutput::Query { columns, .. } = &output {
+        write_row_description(writer, columns)?;
+    }
+    write_output_rows_only(writer, output)
+}
+
+fn write_row_description(
+    writer: &mut BufWriter<TcpStream>,
+    columns: &[quantadb_engine::OutputColumn],
+) -> std::io::Result<()> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&(columns.len() as i16).to_be_bytes());
+    for column in columns {
+        body.extend_from_slice(column.name.as_bytes());
+        body.push(0);
+        body.extend_from_slice(&0_i32.to_be_bytes());
+        body.extend_from_slice(&0_i16.to_be_bytes());
+        body.extend_from_slice(&type_oid(&column.data_type).to_be_bytes());
+        body.extend_from_slice(&(-1_i16).to_be_bytes());
+        body.extend_from_slice(&(-1_i32).to_be_bytes());
+        body.extend_from_slice(&0_i16.to_be_bytes());
+    }
+    write_message(writer, b'T', &body)
+}
+
+/// Write a statement's data and completion tag without a row description,
+/// which is what Execute in the extended protocol requires.
+fn write_output_rows_only(
+    writer: &mut BufWriter<TcpStream>,
+    output: StatementOutput,
+) -> std::io::Result<()> {
     match output {
         StatementOutput::Transaction(state) => {
             let tag = match state {
@@ -217,21 +677,7 @@ fn write_output(writer: &mut BufWriter<TcpStream>, output: StatementOutput) -> s
             };
             write_command_complete(writer, &text)
         }
-        StatementOutput::Query { columns, rows } => {
-            let mut body = Vec::new();
-            body.extend_from_slice(&(columns.len() as i16).to_be_bytes());
-            for column in &columns {
-                body.extend_from_slice(column.name.as_bytes());
-                body.push(0);
-                body.extend_from_slice(&0_i32.to_be_bytes());
-                body.extend_from_slice(&0_i16.to_be_bytes());
-                body.extend_from_slice(&type_oid(&column.data_type).to_be_bytes());
-                body.extend_from_slice(&(-1_i16).to_be_bytes());
-                body.extend_from_slice(&(-1_i32).to_be_bytes());
-                body.extend_from_slice(&0_i16.to_be_bytes());
-            }
-            write_message(writer, b'T', &body)?;
-
+        StatementOutput::Query { columns: _, rows } => {
             let row_count = rows.len();
             for row in rows {
                 let mut body = Vec::new();
@@ -466,6 +912,100 @@ mod tests {
             );
             client.query("ROLLBACK");
             client.read_until_ready();
+        });
+        exchange.await.expect("client thread");
+    }
+
+    #[test]
+    fn parameter_substitution_is_quote_safe() {
+        let literals = vec![quote_literal("o'brien"), "42".to_owned()];
+        let substituted = substitute_parameters(
+            "SELECT id FROM t WHERE name = $1 AND age = $2 AND tag = '$1'",
+            &literals,
+        )
+        .expect("substitution");
+        assert_eq!(
+            substituted, "SELECT id FROM t WHERE name = 'o''brien' AND age = 42 AND tag = '$1'",
+            "quotes double, and a placeholder inside a string stays untouched"
+        );
+        assert_eq!(count_parameters("SELECT $2, $1, '$9' -- $5"), 2);
+        assert!(substitute_parameters("SELECT $3", &["'a'".to_owned()]).is_err());
+    }
+
+    impl PgClient {
+        fn send(&mut self, kind: u8, body: &[u8]) {
+            let mut framed = vec![kind];
+            framed.extend_from_slice(&((body.len() as i32) + 4).to_be_bytes());
+            framed.extend_from_slice(body);
+            self.stream.write_all(&framed).expect("send");
+        }
+    }
+
+    #[tokio::test]
+    async fn speaks_the_extended_query_protocol() {
+        let directory = tempdir().expect("tempdir");
+        let engine =
+            DatabaseEngine::open(directory.path(), MvccOptions::default()).expect("engine");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(serve_postgres(listener, engine, 8, std::future::pending()));
+
+        let exchange = tokio::task::spawn_blocking(move || {
+            let mut client = PgClient::connect(address);
+            client.read_until_ready();
+            client.query(
+                "CREATE TABLE crew (id BIGINT PRIMARY KEY, name TEXT NOT NULL); \
+                 INSERT INTO crew (id, name) VALUES (1, 'ada'), (2, 'o''brien')",
+            );
+            client.read_until_ready();
+
+            let mut parse = b"find\0SELECT id, name FROM crew WHERE name = $1\0".to_vec();
+            parse.extend_from_slice(&0_i16.to_be_bytes());
+            client.send(b'P', &parse);
+
+            let mut describe_statement = b"S".to_vec();
+            describe_statement.extend_from_slice(b"find\0");
+            client.send(b'D', &describe_statement);
+
+            let mut bind = b"\0find\0".to_vec();
+            bind.extend_from_slice(&1_i16.to_be_bytes());
+            bind.extend_from_slice(&0_i16.to_be_bytes());
+            bind.extend_from_slice(&1_i16.to_be_bytes());
+            let value = b"o'brien";
+            bind.extend_from_slice(&(value.len() as i32).to_be_bytes());
+            bind.extend_from_slice(value);
+            bind.extend_from_slice(&0_i16.to_be_bytes());
+            client.send(b'B', &bind);
+
+            client.send(b'E', b"\0\0\0\0\0");
+            client.send(b'S', &[]);
+
+            let messages = client.read_until_ready();
+            assert_eq!(
+                kinds(&messages),
+                vec![b'1', b't', b'T', b'2', b'D', b'C', b'Z'],
+                "parse, parameter and row descriptions, bind, one row, complete, ready"
+            );
+            let data_row = String::from_utf8_lossy(&messages[4].1);
+            assert!(data_row.contains("o'brien"), "{data_row:?}");
+
+            let mut bad_bind = b"\0missing\0".to_vec();
+            bad_bind.extend_from_slice(&0_i16.to_be_bytes());
+            bad_bind.extend_from_slice(&0_i16.to_be_bytes());
+            bad_bind.extend_from_slice(&0_i16.to_be_bytes());
+            client.send(b'B', &bad_bind);
+            client.send(b'E', b"\0\0\0\0\0");
+            client.send(b'S', &[]);
+            let failed = client.read_until_ready();
+            assert_eq!(
+                kinds(&failed),
+                vec![b'E', b'Z'],
+                "the execute after a failed bind is skipped until sync"
+            );
+            let error_text = String::from_utf8_lossy(&failed[0].1);
+            assert!(error_text.contains("26000"), "{error_text:?}");
         });
         exchange.await.expect("client thread");
     }
