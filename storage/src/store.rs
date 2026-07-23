@@ -36,15 +36,58 @@ impl Default for StoreOptions {
     }
 }
 
+/// Committed pages that have not reached the data file yet.
+///
+/// A commit is durable once its WAL batch is synced; the page images stay
+/// here until a checkpoint flushes them. Readers check this table before
+/// the data file, and entries leave only after the flushed pages are
+/// synced, so a reader always finds every committed page in one of the
+/// two places. A crash loses nothing: recovery replays the same images
+/// from the committed WAL batches.
+pub(crate) struct DirtyPages {
+    pages: std::sync::RwLock<std::collections::HashMap<PageId, Page>>,
+}
+
+impl DirtyPages {
+    fn get(&self, page_id: PageId) -> Result<Option<Page>> {
+        Ok(self
+            .pages
+            .read()
+            .map_err(|_| StorageError::Poisoned)?
+            .get(&page_id)
+            .cloned())
+    }
+}
+
+/// A lock-free read path shared with the commit coordinator's handle.
+///
+/// Reads consult the dirty table under a short read lock and fall back to
+/// positional reads on a second data-file handle, so they never wait on
+/// the store mutex a committing batch holds across its WAL sync.
+pub struct SharedReader {
+    dirty: std::sync::Arc<DirtyPages>,
+    file: File,
+}
+
+impl SharedReader {
+    pub fn read_page(&self, page_id: PageId) -> Result<Option<Page>> {
+        if let Some(page) = self.dirty.get(page_id)? {
+            return Ok(Some(page));
+        }
+        crate::data_file::read_shared(&self.file, page_id)
+    }
+}
+
 /// A strictly durable physical page store.
 ///
-/// Each write synchronizes its WAL record before writing and synchronizing the
-/// data page. This is intentionally conservative; group commit will batch the
-/// same ordering guarantee without weakening it.
+/// Each commit batch synchronizes exactly one file: the WAL. Data pages
+/// accumulate in the dirty table and reach the data file at checkpoints,
+/// which flush, sync, and only then truncate the log that protects them.
 pub struct DurableStore {
     root: PathBuf,
     data: DataFile,
     wal: Wal,
+    dirty: std::sync::Arc<DirtyPages>,
     next_page_id: u64,
     /// Released page IDs waiting for reuse.
     ///
@@ -84,6 +127,9 @@ impl DurableStore {
             root,
             data,
             wal,
+            dirty: std::sync::Arc::new(DirtyPages {
+                pages: std::sync::RwLock::new(std::collections::HashMap::new()),
+            }),
             next_page_id: 0,
             free_pages: std::collections::BTreeSet::new(),
             poisoned: false,
@@ -148,11 +194,31 @@ impl DurableStore {
     }
 
     pub fn read_page(&mut self, page_id: PageId) -> Result<Option<Page>> {
+        if let Some(page) = self.dirty.get(page_id)? {
+            return Ok(Some(page));
+        }
         self.data.read(page_id)
     }
 
+    /// Open the lock-free read path for concurrent readers.
+    pub fn shared_reader(&self) -> Result<SharedReader> {
+        Ok(SharedReader {
+            dirty: std::sync::Arc::clone(&self.dirty),
+            file: self.data.share()?,
+        })
+    }
+
     pub fn page_count(&self) -> Result<u64> {
-        self.data.page_count()
+        let dirty_end = self
+            .dirty
+            .pages
+            .read()
+            .map_err(|_| StorageError::Poisoned)?
+            .keys()
+            .map(|page_id| page_id.0.saturating_add(1))
+            .max()
+            .unwrap_or(0);
+        Ok(self.data.page_count()?.max(dirty_end))
     }
 
     /// Reserve contiguous IDs without writing pages.
@@ -220,20 +286,54 @@ impl DurableStore {
         self.wal.append_batch_commit(writes.len())?;
         self.wal.sync()?;
 
+        let mut dirty = self
+            .dirty
+            .pages
+            .write()
+            .map_err(|_| StorageError::Poisoned)?;
         for (write, lsn) in writes.iter().zip(&lsns) {
             let page = Page::with_lsn(write.page_id, *lsn, write.payload.clone())?;
-            self.data.write(&page)?;
+            dirty.insert(write.page_id, page);
             self.next_page_id = self.next_page_id.max(write.page_id.0.saturating_add(1));
         }
-        self.data.sync()?;
         Ok(lsns)
     }
 
     fn checkpoint_inner(&mut self) -> Result<Lsn> {
+        // Flush and sync every dirty page before the log that protects them
+        // shrinks. Entries leave the table only after the sync, so a reader
+        // always finds each page in the table or, once removed, in the
+        // synced file; there is no torn-read window in between.
+        let flushed: Vec<Page> = {
+            let dirty = self
+                .dirty
+                .pages
+                .read()
+                .map_err(|_| StorageError::Poisoned)?;
+            dirty.values().cloned().collect()
+        };
+        for page in &flushed {
+            self.data.write(page)?;
+        }
         self.data.sync()?;
+
         let lsn = self.wal.append_checkpoint()?;
         self.wal.sync()?;
         self.wal.reset_after_checkpoint()?;
+
+        let mut dirty = self
+            .dirty
+            .pages
+            .write()
+            .map_err(|_| StorageError::Poisoned)?;
+        for page in &flushed {
+            if dirty
+                .get(&page.id())
+                .is_some_and(|current| current.lsn() == page.lsn())
+            {
+                dirty.remove(&page.id());
+            }
+        }
         Ok(lsn)
     }
 
@@ -467,8 +567,12 @@ mod tests {
             let mut store =
                 DurableStore::open(directory.path(), StoreOptions::default()).expect("open");
             store
+                .write_page(PageId(0), b"stale".to_vec())
+                .expect("write first version");
+            store.checkpoint().expect("flush the page to the data file");
+            store
                 .write_page(PageId(0), b"recoverable".to_vec())
-                .expect("write");
+                .expect("write the newer version into the log");
         }
         {
             let data_path = directory.path().join(DATA_FILE_NAME);
@@ -485,7 +589,8 @@ mod tests {
                 .expect("read")
                 .expect("page")
                 .payload(),
-            b"recoverable"
+            b"recoverable",
+            "the newer log image must repair the corrupt on-disk page"
         );
     }
 
