@@ -30,6 +30,7 @@ Uncommitted catalog and row changes are invisible to other sessions.
 ## Current execution surface
 
 - `CREATE TABLE` and `DROP TABLE`
+- `CREATE [UNIQUE] INDEX` with backfill and `DROP INDEX`
 - multi-row `INSERT`
 - `SELECT` projections, expressions, `WHERE`, `ORDER BY`, and `LIMIT`
 - `UPDATE` expressions and predicates
@@ -39,12 +40,23 @@ Uncommitted catalog and row changes are invisible to other sessions.
 - SQL three-valued boolean logic and checked numeric arithmetic
 - primary-key and unique-column equality point access for SELECT/UPDATE/DELETE,
   with scan fallback for other predicates
+- secondary index equality access: a unique index answers with one entry
+  lookup, a regular index with an entry prefix scan, and a composite index
+  serves equality on its leading column
+
+Secondary indexes live in the same MVCC keyspace as rows. A unique index
+keys entries on the indexed values alone, so duplicates collide inside a
+transaction and conflict across transactions at commit, exactly like UNIQUE
+columns. A regular index appends the row key, so equal values coexist.
+Rows with a NULL in any indexed column are not indexed, which gives unique
+indexes the usual NULLs-never-conflict behavior. Entries move with their
+rows on INSERT, UPDATE, and DELETE, and CREATE INDEX backfills from the
+current snapshot in the same transaction that registers the index.
 
 ## Remaining work
 
-- secondary `CREATE INDEX` execution and catalog metadata
 - joins, grouping, parameters, and subqueries
 - binder/planner separation and cost-based plans
-- non-unique secondary indexes and richer predicate/range planning
+- range and multi-column predicate planning over secondary indexes
 - durable schema migrations and broader SQL types
 - statement cancellation and query memory budgets

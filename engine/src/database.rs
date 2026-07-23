@@ -1,11 +1,13 @@
 use crate::{
     access::{self, AccessPath},
     codec::{
-        catalog_key, decode_row, decode_schema, decode_u64, encode_identity, encode_row,
-        encode_schema, encode_u64, row_key, row_prefix, table_id_counter_key, unique_key,
-        unique_prefix,
+        catalog_key, decode_index, decode_row, decode_schema, decode_u64, encode_identity,
+        encode_index, encode_row, encode_schema, encode_u64, index_catalog_key,
+        index_catalog_prefix, index_entry_key, index_entry_prefix, index_id_counter_key, row_key,
+        row_prefix, table_id_counter_key, unique_key, unique_prefix,
     },
     expression::{evaluate, infer_type, predicate},
+    schema::IndexSchema,
     EngineError, OutputColumn, Result, StatementOutput, TableSchema, TransactionOutput, Value,
 };
 use quantadb_mvcc::{MvccDatabase, MvccOptions, Transaction};
@@ -171,8 +173,79 @@ fn execute_in_transaction(
             for (constraint_key, _) in transaction.scan_prefix(&unique_prefix(schema.id))? {
                 transaction.delete(constraint_key)?;
             }
+            for index in load_table_indexes(transaction, schema.id)? {
+                for (entry_key, _) in transaction.scan_prefix(&index_entry_prefix(index.id))? {
+                    transaction.delete(entry_key)?;
+                }
+                transaction.delete(index_catalog_key(&index.name)?)?;
+            }
             transaction.delete(key)?;
             Ok(command("DROP TABLE", 0))
+        }
+        Statement::CreateIndex(create) => {
+            let index_key = index_catalog_key(&create.name.value)?;
+            if transaction.get(&index_key)?.is_some() {
+                return if create.if_not_exists {
+                    Ok(command("CREATE INDEX", 0))
+                } else {
+                    Err(EngineError::IndexAlreadyExists(create.name.value))
+                };
+            }
+            let schema = load_schema(transaction, &create.table.value)?;
+            let mut columns = Vec::with_capacity(create.columns.len());
+            for identifier in &create.columns {
+                let position = schema
+                    .columns
+                    .iter()
+                    .position(|column| column.name == identifier.value)
+                    .ok_or_else(|| EngineError::ColumnNotFound(identifier.value.clone()))?;
+                if columns.contains(&position) {
+                    return Err(EngineError::InvalidSchema(format!(
+                        "column {} appears more than once in the index",
+                        identifier.value
+                    )));
+                }
+                columns.push(position);
+            }
+            let next_id = transaction
+                .get(index_id_counter_key())?
+                .map_or(Ok(1), |bytes| decode_u64(&bytes))?;
+            let following_id = next_id
+                .checked_add(1)
+                .ok_or_else(|| EngineError::InvalidSchema("index ID space exhausted".to_owned()))?;
+            let index = IndexSchema {
+                format_version: 1,
+                id: next_id,
+                name: create.name.value,
+                table_id: schema.id,
+                columns,
+                unique: create.unique,
+            };
+            transaction.put(index_id_counter_key().to_vec(), encode_u64(following_id))?;
+            transaction.put(index_key, encode_index(&index)?)?;
+
+            let indexes = std::slice::from_ref(&index);
+            for (existing_key, bytes) in transaction.scan_prefix(&row_prefix(schema.id))? {
+                let values = decode_row(&bytes)?;
+                add_index_entries(transaction, indexes, &values, &existing_key)?;
+            }
+            Ok(command("CREATE INDEX", 0))
+        }
+        Statement::DropIndex(drop) => {
+            let index_key = index_catalog_key(&drop.name.value)?;
+            let Some(bytes) = transaction.get(&index_key)? else {
+                return if drop.if_exists {
+                    Ok(command("DROP INDEX", 0))
+                } else {
+                    Err(EngineError::IndexNotFound(drop.name.value))
+                };
+            };
+            let index = decode_index(&bytes)?;
+            for (entry_key, _) in transaction.scan_prefix(&index_entry_prefix(index.id))? {
+                transaction.delete(entry_key)?;
+            }
+            transaction.delete(index_key)?;
+            Ok(command("DROP INDEX", 0))
         }
         Statement::Insert(insert) => execute_insert(transaction, insert),
         Statement::Select(select) => execute_select(transaction, select),
@@ -206,6 +279,7 @@ fn execute_update(transaction: &mut Transaction, update: Update) -> Result<State
         })
         .collect::<Result<Vec<_>>>()?;
     let mut rows = read_rows(transaction, &schema, update.selection.as_ref())?;
+    let indexes = load_table_indexes(transaction, schema.id)?;
     let mut affected = 0_u64;
 
     for position in 0..rows.len() {
@@ -241,6 +315,8 @@ fn execute_update(transaction: &mut Transaction, update: Update) -> Result<State
             &old_key,
             &new_key,
         )?;
+        remove_index_entries(transaction, &indexes, &original, &old_key)?;
+        add_index_entries(transaction, &indexes, &updated, &new_key)?;
         if new_key != old_key {
             if transaction.get(&new_key)?.is_some()
                 || rows
@@ -263,6 +339,7 @@ fn execute_update(transaction: &mut Transaction, update: Update) -> Result<State
 
 fn execute_delete(transaction: &mut Transaction, delete: Delete) -> Result<StatementOutput> {
     let schema = load_schema(transaction, &delete.table.value)?;
+    let indexes = load_table_indexes(transaction, schema.id)?;
     let mut affected = 0_u64;
     for (key, values) in read_rows(transaction, &schema, delete.selection.as_ref())? {
         schema.validate_row(&values)?;
@@ -272,6 +349,7 @@ fn execute_delete(transaction: &mut Transaction, delete: Delete) -> Result<State
         };
         if selected {
             release_unique_keys(transaction, &schema, &values)?;
+            remove_index_entries(transaction, &indexes, &values, &key)?;
             transaction.delete(key)?;
             affected += 1;
         }
@@ -309,6 +387,7 @@ fn execute_insert(transaction: &mut Transaction, insert: Insert) -> Result<State
         .into_iter()
         .map(|(_, bytes)| decode_row(&bytes))
         .collect::<Result<Vec<_>>>()?;
+    let indexes = load_table_indexes(transaction, schema.id)?;
     let mut new_rows = Vec::new();
 
     for expressions in insert.rows {
@@ -347,6 +426,7 @@ fn execute_insert(transaction: &mut Transaction, insert: Insert) -> Result<State
             ));
         }
         acquire_unique_keys(transaction, &schema, &values, &key)?;
+        add_index_entries(transaction, &indexes, &values, &key)?;
         transaction.put(key, encode_row(&values)?)?;
         new_rows.push(values);
     }
@@ -470,6 +550,71 @@ fn load_schema(transaction: &Transaction, name: &str) -> Result<TableSchema> {
         .and_then(|bytes| decode_schema(&bytes))
 }
 
+pub(crate) fn load_table_indexes(
+    transaction: &Transaction,
+    table_id: u64,
+) -> Result<Vec<IndexSchema>> {
+    let mut indexes = Vec::new();
+    for (_, bytes) in transaction.scan_prefix(index_catalog_prefix())? {
+        let index = decode_index(&bytes)?;
+        if index.table_id == table_id {
+            indexes.push(index);
+        }
+    }
+    Ok(indexes)
+}
+
+/// The indexed values of one row, or nothing when any of them is NULL.
+fn indexed_values<'a>(index: &IndexSchema, values: &'a [Value]) -> Option<Vec<&'a Value>> {
+    let selected = index
+        .columns
+        .iter()
+        .map(|position| &values[*position])
+        .collect::<Vec<_>>();
+    if selected.iter().any(|value| value.is_null()) {
+        None
+    } else {
+        Some(selected)
+    }
+}
+
+fn add_index_entries(
+    transaction: &mut Transaction,
+    indexes: &[IndexSchema],
+    values: &[Value],
+    row_key: &[u8],
+) -> Result<()> {
+    for index in indexes {
+        let Some(selected) = indexed_values(index, values) else {
+            continue;
+        };
+        let entry = index_entry_key(index, &selected, row_key)?;
+        if index.unique && transaction.get(&entry)?.is_some() {
+            return Err(EngineError::ConstraintViolation(format!(
+                "duplicate value for unique index {}",
+                index.name
+            )));
+        }
+        transaction.put(entry, row_key.to_vec())?;
+    }
+    Ok(())
+}
+
+fn remove_index_entries(
+    transaction: &mut Transaction,
+    indexes: &[IndexSchema],
+    values: &[Value],
+    row_key: &[u8],
+) -> Result<()> {
+    for index in indexes {
+        let Some(selected) = indexed_values(index, values) else {
+            continue;
+        };
+        transaction.delete(index_entry_key(index, &selected, row_key)?)?;
+    }
+    Ok(())
+}
+
 fn read_rows(
     transaction: &Transaction,
     schema: &TableSchema,
@@ -486,6 +631,16 @@ fn read_rows(
             .get(&key)?
             .map(|bytes| decode_row(&bytes).map(|row| vec![(key, row)]))
             .unwrap_or_else(|| Ok(Vec::new())),
+        AccessPath::IndexPrefix(prefix) => {
+            let mut rows = Vec::new();
+            for (_, row_key) in transaction.scan_prefix(&prefix)? {
+                let bytes = transaction.get(&row_key)?.ok_or_else(|| {
+                    EngineError::CorruptRecord("index entry points to a missing row".to_owned())
+                })?;
+                rows.push((row_key, decode_row(&bytes)?));
+            }
+            Ok(rows)
+        }
     }
 }
 
@@ -658,6 +813,155 @@ mod tests {
             StatementOutput::Query { rows, .. } => rows,
             other => panic!("expected a query result, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn secondary_indexes_serve_backfill_maintenance_and_uniqueness() {
+        let directory = tempdir().expect("tempdir");
+        let engine =
+            DatabaseEngine::open(directory.path(), MvccOptions::default()).expect("engine");
+        let mut session = engine.session();
+        session
+            .execute("CREATE TABLE people (id BIGINT PRIMARY KEY, city TEXT, badge BIGINT)")
+            .expect("create table");
+        session
+            .execute(
+                "INSERT INTO people (id, city, badge) VALUES \
+                 (1, 'oslo', 100), (2, 'kyiv', 200), (3, 'oslo', 300), (4, NULL, 400)",
+            )
+            .expect("insert");
+
+        session
+            .execute("CREATE INDEX people_city ON people (city)")
+            .expect("create index backfills existing rows");
+        session
+            .execute("CREATE UNIQUE INDEX people_badge ON people (badge)")
+            .expect("create unique index");
+        assert!(matches!(
+            session.execute("CREATE INDEX people_city ON people (city)"),
+            Err(EngineError::IndexAlreadyExists(name)) if name == "people_city"
+        ));
+        session
+            .execute("CREATE INDEX IF NOT EXISTS people_city ON people (city)")
+            .expect("IF NOT EXISTS is quiet");
+
+        let rows = query_rows(
+            &mut session,
+            "SELECT id FROM people WHERE city = 'oslo' ORDER BY id",
+        );
+        assert_eq!(
+            rows.iter().map(|row| row[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Integer(1), Value::Integer(3)],
+            "the index lookup returns exactly the matching rows"
+        );
+
+        assert!(
+            matches!(
+                session.execute(
+                    "INSERT INTO people (id, city, badge) VALUES (5, 'lima', 100)"
+                ),
+                Err(EngineError::ConstraintViolation(message)) if message.contains("people_badge")
+            ),
+            "the unique index rejects duplicates on insert"
+        );
+        session
+            .execute("INSERT INTO people (id, city, badge) VALUES (5, 'lima', NULL)")
+            .expect("NULLs never conflict in a unique index");
+
+        session
+            .execute("UPDATE people SET city = 'kyiv' WHERE id = 1")
+            .expect("update moves index entries");
+        let rows = query_rows(
+            &mut session,
+            "SELECT id FROM people WHERE city = 'kyiv' ORDER BY id",
+        );
+        assert_eq!(rows.len(), 2, "the moved row is found under its new value");
+        let rows = query_rows(&mut session, "SELECT id FROM people WHERE city = 'oslo'");
+        assert_eq!(rows.len(), 1, "the moved row left its old value");
+
+        session
+            .execute("DELETE FROM people WHERE id = 3")
+            .expect("delete removes index entries");
+        let rows = query_rows(&mut session, "SELECT id FROM people WHERE city = 'oslo'");
+        assert_eq!(rows.len(), 0, "deleted rows leave the index");
+
+        session
+            .execute("DROP INDEX people_city")
+            .expect("drop index");
+        assert!(matches!(
+            session.execute("DROP INDEX people_city"),
+            Err(EngineError::IndexNotFound(_))
+        ));
+        session
+            .execute("DROP INDEX IF EXISTS people_city")
+            .expect("IF EXISTS is quiet");
+        let rows = query_rows(
+            &mut session,
+            "SELECT id FROM people WHERE city = 'kyiv' ORDER BY id",
+        );
+        assert_eq!(
+            rows.len(),
+            2,
+            "queries fall back to scans without the index"
+        );
+    }
+
+    #[test]
+    fn unique_index_backfill_rejects_existing_duplicates() {
+        let directory = tempdir().expect("tempdir");
+        let engine =
+            DatabaseEngine::open(directory.path(), MvccOptions::default()).expect("engine");
+        let mut session = engine.session();
+        session
+            .execute("CREATE TABLE dup (id BIGINT PRIMARY KEY, code BIGINT)")
+            .expect("create");
+        session
+            .execute("INSERT INTO dup (id, code) VALUES (1, 9), (2, 9)")
+            .expect("insert duplicates");
+        assert!(matches!(
+            session.execute("CREATE UNIQUE INDEX dup_code ON dup (code)"),
+            Err(EngineError::ConstraintViolation(_))
+        ));
+        session
+            .execute("SELECT id FROM dup WHERE code = 9")
+            .expect("the failed index must not leave partial state behind");
+    }
+
+    #[test]
+    fn multi_column_indexes_answer_leading_column_equality() {
+        let directory = tempdir().expect("tempdir");
+        let engine =
+            DatabaseEngine::open(directory.path(), MvccOptions::default()).expect("engine");
+        let mut session = engine.session();
+        session
+            .execute("CREATE TABLE events (id BIGINT PRIMARY KEY, kind TEXT, region TEXT)")
+            .expect("create");
+        session
+            .execute("CREATE INDEX events_kind_region ON events (kind, region)")
+            .expect("create composite index");
+        session
+            .execute(
+                "INSERT INTO events (id, kind, region) VALUES \
+                 (1, 'click', 'eu'), (2, 'click', 'us'), (3, 'view', 'eu')",
+            )
+            .expect("insert");
+
+        let rows = query_rows(
+            &mut session,
+            "SELECT id FROM events WHERE kind = 'click' ORDER BY id",
+        );
+        assert_eq!(
+            rows.iter().map(|row| row[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Integer(1), Value::Integer(2)],
+            "a leading column equality uses the composite index"
+        );
+        session
+            .execute("DROP TABLE events")
+            .expect("drop table cleans indexes up");
+        assert!(matches!(
+            session.execute("DROP INDEX events_kind_region"),
+            Err(EngineError::IndexNotFound(_))
+        ));
     }
 
     #[test]

@@ -91,10 +91,34 @@ fn scan_with_predicate(c: &mut Criterion) {
     group.finish();
 }
 
+fn secondary_index_equality(c: &mut Criterion) {
+    let dir = TempDir::new().expect("temp dir must exist");
+    let engine = seeded_engine(&dir, 10_000);
+    let mut session = engine.session();
+    session
+        .execute("CREATE INDEX accounts_name ON accounts (name)")
+        .expect("create index must succeed");
+
+    let mut group = c.benchmark_group("engine");
+    let mut probe = 0_u64;
+    group.bench_function("indexed_equality_10k_rows", |b| {
+        b.iter(|| {
+            probe = (probe + 7919) % 10_000;
+            session
+                .execute(black_box(&format!(
+                    "SELECT id, balance FROM accounts WHERE name = 'account {probe}'"
+                )))
+                .expect("select must succeed")
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     autocommit_insert,
     point_select,
-    scan_with_predicate
+    scan_with_predicate,
+    secondary_index_equality
 );
 criterion_main!(benches);

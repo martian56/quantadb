@@ -22,6 +22,12 @@ pub enum EngineError {
     #[error("table does not exist: {0}")]
     TableNotFound(String),
 
+    #[error("index already exists: {0}")]
+    IndexAlreadyExists(String),
+
+    #[error("index does not exist: {0}")]
+    IndexNotFound(String),
+
     #[error("invalid schema: {0}")]
     InvalidSchema(String),
 

@@ -1,5 +1,6 @@
 use crate::{
-    codec::{encode_identity, row_key, unique_key},
+    codec::{encode_identity, index_value_prefix, row_key, unique_key},
+    database::load_table_indexes,
     expression::evaluate,
     EngineError, Result, TableSchema, Value,
 };
@@ -9,6 +10,8 @@ use quantadb_syntax::{BinaryOperator, Expr};
 pub(crate) enum AccessPath {
     Scan,
     Point(Option<Vec<u8>>),
+    /// Scan index entries under this prefix; each entry's value is a row key.
+    IndexPrefix(Vec<u8>),
 }
 
 pub(crate) fn plan(
@@ -27,9 +30,6 @@ pub(crate) fn plan(
         return Err(EngineError::ColumnNotFound(column_name.to_owned()));
     };
     let column = &schema.columns[position];
-    if !column.primary_key && !column.unique {
-        return Ok(AccessPath::Scan);
-    }
     let mut value = evaluate(expression, schema, &vec![Value::Null; schema.columns.len()])?;
     if value.is_null() {
         return Ok(AccessPath::Point(None));
@@ -48,8 +48,24 @@ pub(crate) fn plan(
             &encode_identity(&value)?,
         )?)));
     }
-    let owner = transaction.get(&unique_key(schema.id, position, &value)?)?;
-    Ok(AccessPath::Point(owner))
+    if column.unique {
+        let owner = transaction.get(&unique_key(schema.id, position, &value)?)?;
+        return Ok(AccessPath::Point(owner));
+    }
+
+    // A secondary index whose leading column matches serves the equality:
+    // unique through one entry lookup, regular through an entry prefix scan.
+    for index in load_table_indexes(transaction, schema.id)? {
+        if index.columns.first() != Some(&position) {
+            continue;
+        }
+        let prefix = index_value_prefix(index.id, &[&value])?;
+        if index.unique && index.columns.len() == 1 {
+            return Ok(AccessPath::Point(transaction.get(&prefix)?));
+        }
+        return Ok(AccessPath::IndexPrefix(prefix));
+    }
+    Ok(AccessPath::Scan)
 }
 
 fn equality_column_and_constant(expression: &Expr) -> Option<(&str, &Expr)> {
