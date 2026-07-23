@@ -13,7 +13,12 @@ quantadb-storage = { path = "../storage" }
 thiserror.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+name = "transactions"
+harness = false
 
 [lints]
 workspace = true

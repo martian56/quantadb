@@ -1,0 +1,18 @@
+[package]
+name = "quantadb-bench"
+description = "Workload generator and latency reporter for a running QuantaDB server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+
+[[bin]]
+name = "loadgen"
+path = "src/main.rs"
+
+[lints]
+workspace = true

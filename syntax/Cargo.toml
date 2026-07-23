@@ -11,5 +11,12 @@ repository.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "parse"
+harness = false
+
 [lints]
 workspace = true
