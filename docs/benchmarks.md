@@ -75,8 +75,11 @@ Median criterion times:
 | engine/filtered_scan_10k_rows | 18.1 ms |
 
 One `loadgen` pass on the same machine (8 connections, 5 s, 80 percent
-reads, 5000 rows): 736 ops/s total, read p50 388 us and p99 3.5 ms, write
-p50 23 ms and p99 196 ms, 4 conflicts, 0 failures.
+reads, 5000 rows): 2607 ops/s total, read p50 418 us and p99 7.2 ms with an
+18.5 ms maximum, write p50 13.4 ms and p99 26 ms, 20 conflicts, 0 failures.
+The first recorded pass of this workload, before the node cache, online
+publication, reclamation, and the record cache, did 736 ops/s with a write
+p99 of 196 ms and read spikes to 139 ms.
 
 What the baseline already says about the code:
 

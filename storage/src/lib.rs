@@ -5,6 +5,7 @@
 //! belong here.
 
 mod buffer_pool;
+mod byte_lru;
 mod data_file;
 mod error;
 mod group_commit;
@@ -13,6 +14,7 @@ mod store;
 mod wal;
 
 pub use buffer_pool::{BufferPool, BufferPoolStats};
+pub use byte_lru::{ByteCacheStats, SharedByteLru};
 pub use error::{Result, StorageError};
 pub use group_commit::{GroupCommitHandle, GroupCommitOptions, GroupCommitStats, GroupCommitter};
 pub use page::{Lsn, Page, PageId, MAX_PAGE_PAYLOAD, PAGE_SIZE};

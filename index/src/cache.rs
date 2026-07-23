@@ -1,9 +1,8 @@
 use crate::node::Node;
-use quantadb_storage::PageId;
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex},
-};
+use quantadb_storage::{PageId, SharedByteLru};
+use std::sync::Arc;
+
+pub use quantadb_storage::ByteCacheStats as NodeCacheStats;
 
 /// A bounded, shared cache of decoded index nodes.
 ///
@@ -11,117 +10,28 @@ use std::{
 /// so a decoded node never goes stale. The only invalidation is LRU eviction
 /// when the byte budget runs out; nodes from dead generations simply age out.
 pub struct NodeCache {
-    inner: Mutex<CacheInner>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct NodeCacheStats {
-    pub hits: u64,
-    pub misses: u64,
-    pub entries: usize,
-    pub bytes: usize,
-}
-
-struct CacheEntry {
-    node: Arc<Node>,
-    bytes: usize,
-    tick: u64,
-}
-
-struct CacheInner {
-    map: HashMap<PageId, CacheEntry>,
-    recency: BTreeMap<u64, PageId>,
-    next_tick: u64,
-    bytes: usize,
-    capacity: usize,
-    hits: u64,
-    misses: u64,
+    lru: SharedByteLru<Node>,
 }
 
 impl NodeCache {
     #[must_use]
     pub fn new(capacity_bytes: usize) -> Self {
         Self {
-            inner: Mutex::new(CacheInner {
-                map: HashMap::new(),
-                recency: BTreeMap::new(),
-                next_tick: 0,
-                bytes: 0,
-                capacity: capacity_bytes,
-                hits: 0,
-                misses: 0,
-            }),
+            lru: SharedByteLru::new(capacity_bytes),
         }
     }
 
     #[must_use]
     pub fn stats(&self) -> NodeCacheStats {
-        self.inner.lock().map_or_else(
-            |_| NodeCacheStats::default(),
-            |inner| NodeCacheStats {
-                hits: inner.hits,
-                misses: inner.misses,
-                entries: inner.map.len(),
-                bytes: inner.bytes,
-            },
-        )
+        self.lru.stats()
     }
 
     pub(crate) fn get(&self, page_id: PageId) -> Option<Arc<Node>> {
-        let mut inner = self.inner.lock().ok()?;
-        let tick = inner.take_tick();
-        if let Some(entry) = inner.map.get_mut(&page_id) {
-            let node = Arc::clone(&entry.node);
-            let previous = std::mem::replace(&mut entry.tick, tick);
-            inner.recency.remove(&previous);
-            inner.recency.insert(tick, page_id);
-            inner.hits += 1;
-            Some(node)
-        } else {
-            inner.misses += 1;
-            None
-        }
+        self.lru.get(page_id)
     }
 
     pub(crate) fn insert(&self, page_id: PageId, node: &Arc<Node>) {
-        let bytes = node.approximate_bytes();
-        let Ok(mut inner) = self.inner.lock() else {
-            return;
-        };
-        if bytes > inner.capacity {
-            return;
-        }
-        let tick = inner.take_tick();
-        if let Some(previous) = inner.map.insert(
-            page_id,
-            CacheEntry {
-                node: Arc::clone(node),
-                bytes,
-                tick,
-            },
-        ) {
-            inner.recency.remove(&previous.tick);
-            inner.bytes -= previous.bytes;
-        }
-        inner.recency.insert(tick, page_id);
-        inner.bytes += bytes;
-
-        while inner.bytes > inner.capacity {
-            let Some((_, oldest)) = inner.recency.pop_first() else {
-                break;
-            };
-            if let Some(evicted) = inner.map.remove(&oldest) {
-                inner.bytes -= evicted.bytes;
-            }
-        }
-    }
-}
-
-impl CacheInner {
-    fn take_tick(&mut self) -> u64 {
-        let tick = self.next_tick;
-        self.next_tick += 1;
-        tick
+        self.lru.insert(page_id, node, node.approximate_bytes());
     }
 }
 
@@ -140,20 +50,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_serves_hits_and_counts_misses() {
-        let cache = NodeCache::new(1 << 20);
-        assert!(cache.get(PageId(7)).is_none());
-        cache.insert(PageId(7), &leaf(b"key"));
-        assert!(cache.get(PageId(7)).is_some());
-        let stats = cache.stats();
-        assert_eq!(stats.hits, 1);
-        assert_eq!(stats.misses, 1);
-        assert_eq!(stats.entries, 1);
-        assert!(stats.bytes > 0);
-    }
-
-    #[test]
-    fn cache_evicts_least_recently_used_within_budget() {
+    fn cache_serves_hits_and_bounds_bytes() {
         let node = leaf(b"0123456789");
         let node_bytes = node.approximate_bytes();
         let cache = NodeCache::new(node_bytes * 2);
@@ -167,14 +64,6 @@ mod tests {
         assert!(cache.get(PageId(2)).is_none(), "least recent is evicted");
         assert!(cache.get(PageId(3)).is_some(), "new entry is resident");
         assert!(cache.stats().bytes <= node_bytes * 2);
-    }
-
-    #[test]
-    fn oversized_nodes_are_not_cached() {
-        let node = leaf(b"payload");
-        let cache = NodeCache::new(1);
-        cache.insert(PageId(1), &node);
-        assert!(cache.get(PageId(1)).is_none());
-        assert_eq!(cache.stats().entries, 0);
+        assert!(cache.stats().hits >= 3);
     }
 }

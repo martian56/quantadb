@@ -15,6 +15,11 @@ pub(crate) struct VersionRecord {
 }
 
 impl VersionRecord {
+    /// Approximate resident size, used for cache accounting.
+    pub(crate) fn approximate_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.key.len() + self.value.as_ref().map_or(0, Vec::len)
+    }
+
     pub(crate) fn validate_size(key: &[u8], value: Option<&[u8]>) -> Result<()> {
         let value_length = value.map_or(0, <[u8]>::len);
         let actual = HEADER_SIZE
