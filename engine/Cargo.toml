@@ -15,7 +15,13 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
+quantadb-mvcc = { path = "../mvcc" }
 tempfile.workspace = true
+
+[[bench]]
+name = "execute"
+harness = false
 
 [lints]
 workspace = true
