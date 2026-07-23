@@ -1,7 +1,7 @@
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use quantadb_index::{BPlusTree, IndexEntry, IndexMutation, IndexRoot};
+use quantadb_index::{BPlusTree, IndexEntry, IndexMutation, IndexRoot, NodeCache};
 use quantadb_storage::{
     GroupCommitHandle, GroupCommitOptions, GroupCommitter, PageId, StoreOptions,
 };
@@ -35,10 +35,19 @@ fn point_lookup(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("tree");
     let mut probe = 0_u64;
-    group.bench_function("point_lookup_100k", |b| {
+    group.bench_function("point_lookup_100k_uncached", |b| {
         b.iter(|| {
             probe = (probe + 7919) % TREE_ENTRIES;
-            BPlusTree::get(&handle, root, black_box(&key(probe)))
+            BPlusTree::get(&handle, None, root, black_box(&key(probe)))
+                .expect("lookup must succeed")
+                .expect("key must exist")
+        });
+    });
+    let cache = NodeCache::new(64 << 20);
+    group.bench_function("point_lookup_100k_cached", |b| {
+        b.iter(|| {
+            probe = (probe + 7919) % TREE_ENTRIES;
+            BPlusTree::get(&handle, Some(&cache), root, black_box(&key(probe)))
                 .expect("lookup must succeed")
                 .expect("key must exist")
         });
@@ -52,12 +61,20 @@ fn range_scan(c: &mut Criterion) {
     let dir = TempDir::new().expect("temp dir must exist");
     let (committer, handle, root) = built_tree(&dir);
 
+    let cache = NodeCache::new(64 << 20);
     let mut group = c.benchmark_group("tree");
     group.bench_function("range_scan_100_of_100k", |b| {
         b.iter(|| {
             let start = key(40_000);
-            BPlusTree::range(&handle, root, Some(black_box(&start)), None, 100)
-                .expect("scan must succeed")
+            BPlusTree::range(
+                &handle,
+                Some(&cache),
+                root,
+                Some(black_box(&start)),
+                None,
+                100,
+            )
+            .expect("scan must succeed")
         });
     });
     group.finish();
@@ -69,6 +86,7 @@ fn copy_on_write_plan(c: &mut Criterion) {
     let dir = TempDir::new().expect("temp dir must exist");
     let (committer, handle, root) = built_tree(&dir);
 
+    let cache = NodeCache::new(64 << 20);
     let mut group = c.benchmark_group("tree");
     group.bench_function("edit_plan_100_upserts", |b| {
         b.iter(|| {
@@ -78,7 +96,8 @@ fn copy_on_write_plan(c: &mut Criterion) {
                     value: PageId(offset + 1),
                 })
             });
-            BPlusTree::edit_plan(&handle, Some(root), mutations).expect("plan must succeed")
+            BPlusTree::edit_plan(&handle, Some(&cache), Some(root), mutations)
+                .expect("plan must succeed")
         });
     });
     group.finish();

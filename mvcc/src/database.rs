@@ -1,5 +1,5 @@
 use crate::{index_manifest::IndexGeneration, record::VersionRecord, Result, TransactionError};
-use quantadb_index::{BPlusTree, IndexEntry, IndexMutation, IndexRoot};
+use quantadb_index::{BPlusTree, IndexEntry, IndexMutation, IndexRoot, NodeCache, NodeCacheStats};
 use quantadb_storage::{
     DurableStore, GroupCommitHandle, GroupCommitOptions, GroupCommitStats, GroupCommitter, PageId,
     PageWrite, StoreOptions,
@@ -27,6 +27,8 @@ pub struct MvccOptions {
     /// When disabled, generations advance only through explicit
     /// `rebuild_index` or `checkpoint` calls.
     pub online_index: bool,
+    /// Byte budget for the shared cache of decoded index nodes.
+    pub index_cache_bytes: usize,
 }
 
 impl Default for MvccOptions {
@@ -35,6 +37,7 @@ impl Default for MvccOptions {
             store: StoreOptions::default(),
             group_commit: GroupCommitOptions::default(),
             online_index: true,
+            index_cache_bytes: 64 << 20,
         }
     }
 }
@@ -55,6 +58,7 @@ pub struct MvccStats {
     pub indexed_through: Option<Timestamp>,
     pub index_height: Option<u16>,
     pub indexed_keys: u64,
+    pub index_cache: NodeCacheStats,
     pub group_commit: GroupCommitStats,
 }
 
@@ -93,6 +97,7 @@ struct PublishSignal {
 struct Inner {
     state: Mutex<State>,
     storage: GroupCommitHandle,
+    node_cache: NodeCache,
     publish_signal: Mutex<PublishSignal>,
     publish_wake: Condvar,
 }
@@ -164,7 +169,7 @@ impl MvccDatabase {
         let committer = GroupCommitter::start(store, options.group_commit)?;
         let storage = committer.handle();
         if let Some(root) = index_generation.and_then(|generation| generation.root) {
-            BPlusTree::range(&storage, root, None, None, 1)?;
+            BPlusTree::range(&storage, None, root, None, None, 1)?;
         }
         let indexed_through =
             index_generation.map_or(Timestamp(0), |generation| generation.timestamp);
@@ -191,6 +196,7 @@ impl MvccDatabase {
                 dirty_keys,
             }),
             storage,
+            node_cache: NodeCache::new(options.index_cache_bytes),
             publish_signal: Mutex::new(PublishSignal::default()),
             publish_wake: Condvar::new(),
         });
@@ -263,6 +269,7 @@ impl MvccDatabase {
                 .index_generation
                 .and_then(|generation| generation.root)
                 .map_or(0, |root| root.entries),
+            index_cache: self.inner.node_cache.stats(),
             group_commit: self.inner.storage.stats(),
         })
     }
@@ -379,6 +386,7 @@ impl Inner {
         let plan = if let Some(generation) = base_generation {
             BPlusTree::edit_plan(
                 &self.storage,
+                Some(&self.node_cache),
                 generation.root,
                 mutations.unwrap_or_default(),
             )?
@@ -460,7 +468,8 @@ impl Inner {
         let Some(root) = root else {
             return Ok(None);
         };
-        let Some(page_id) = BPlusTree::get(&self.storage, root, key)? else {
+        let Some(page_id) = BPlusTree::get(&self.storage, Some(&self.node_cache), root, key)?
+        else {
             return Ok(None);
         };
         self.read_index_version(page_id, key, snapshot)
@@ -729,6 +738,7 @@ impl Transaction {
             let end = prefix_end(prefix);
             let entries = BPlusTree::range(
                 &self.inner.storage,
+                Some(&self.inner.node_cache),
                 root,
                 Some(prefix),
                 end.as_deref(),
@@ -978,7 +988,7 @@ mod tests {
                     max_batch_pages: 32,
                     max_delay: Duration::from_millis(25),
                 },
-                online_index: false,
+                ..offline_options()
             },
         )
         .expect("open");
