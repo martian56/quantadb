@@ -359,10 +359,15 @@ fn execute_insert(transaction: &mut Transaction, insert: Insert) -> Result<State
 fn execute_select(transaction: &Transaction, select: Select) -> Result<StatementOutput> {
     let schema = load_schema(transaction, &select.from.value)?;
     let columns = projection_columns(&schema, &select.projection)?;
+    for key in &select.order_by {
+        infer_type(&key.expression, &schema)?;
+    }
     let mut rows = Vec::new();
     if select.limit == Some(0) {
         return Ok(StatementOutput::Query { columns, rows });
     }
+
+    let mut sortable = Vec::new();
     for (_, values) in read_rows(transaction, &schema, select.selection.as_ref())? {
         schema.validate_row(&values)?;
         if let Some(selection) = &select.selection {
@@ -379,12 +384,83 @@ fn execute_select(transaction: &Transaction, select: Select) -> Result<Statement
                 }
             }
         }
-        rows.push(projected);
-        if select.limit.is_some_and(|limit| rows.len() as u64 >= limit) {
-            break;
+        if select.order_by.is_empty() {
+            rows.push(projected);
+            if select.limit.is_some_and(|limit| rows.len() as u64 >= limit) {
+                break;
+            }
+        } else {
+            let keys = select
+                .order_by
+                .iter()
+                .map(|key| evaluate(&key.expression, &schema, &values))
+                .collect::<Result<Vec<_>>>()?;
+            sortable.push((keys, projected));
         }
     }
+
+    if !select.order_by.is_empty() {
+        sortable.sort_by(|(left, _), (right, _)| compare_order_keys(left, right, &select.order_by));
+        if let Some(limit) = select.limit {
+            sortable.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        }
+        rows = sortable.into_iter().map(|(_, row)| row).collect();
+    }
     Ok(StatementOutput::Query { columns, rows })
+}
+
+/// Compare two rows key by key with SQL ordering.
+///
+/// Nulls sort after every value ascending and before every value
+/// descending, matching the usual SQL default. Integers and floats compare
+/// numerically; every other comparison is within one type because order
+/// keys are type checked before execution.
+fn compare_order_keys(
+    left: &[Value],
+    right: &[Value],
+    order_by: &[quantadb_syntax::OrderKey],
+) -> std::cmp::Ordering {
+    for (position, key) in order_by.iter().enumerate() {
+        let ordering = compare_sort_values(&left[position], &right[position]);
+        let ordering = if key.descending {
+            ordering.reverse()
+        } else {
+            ordering
+        };
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn compare_sort_values(left: &Value, right: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (left, right) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Greater,
+        (_, Value::Null) => Ordering::Less,
+        (Value::Integer(left), Value::Integer(right)) => left.cmp(right),
+        (Value::Float(left), Value::Float(right)) => left.total_cmp(right),
+        (Value::Integer(left), Value::Float(right)) => (*left as f64).total_cmp(right),
+        (Value::Float(left), Value::Integer(right)) => left.total_cmp(&(*right as f64)),
+        (Value::Boolean(left), Value::Boolean(right)) => left.cmp(right),
+        (Value::Text(left), Value::Text(right)) => left.cmp(right),
+        (left, right) => type_rank(left).cmp(&type_rank(right)),
+    }
+}
+
+/// A last-resort total order between values of different types.
+///
+/// Type checking keeps mixed-type keys out of real queries; this exists so
+/// the comparator stays total no matter what.
+const fn type_rank(value: &Value) -> u8 {
+    match value {
+        Value::Null => 0,
+        Value::Boolean(_) => 1,
+        Value::Integer(_) | Value::Float(_) => 2,
+        Value::Text(_) => 3,
+    }
 }
 
 fn load_schema(transaction: &Transaction, name: &str) -> Result<TableSchema> {
@@ -576,6 +652,73 @@ fn command(tag: &str, affected_rows: u64) -> StatementOutput {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn query_rows(session: &mut SqlSession, sql: &str) -> Vec<Vec<Value>> {
+        match session.execute(sql).expect("query").pop().expect("output") {
+            StatementOutput::Query { rows, .. } => rows,
+            other => panic!("expected a query result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_by_sorts_keys_directions_and_nulls() {
+        let directory = tempdir().expect("tempdir");
+        let engine =
+            DatabaseEngine::open(directory.path(), MvccOptions::default()).expect("engine");
+        let mut session = engine.session();
+        session
+            .execute(
+                "CREATE TABLE ranked (id BIGINT PRIMARY KEY, score DOUBLE, team TEXT NOT NULL)",
+            )
+            .expect("create");
+        session
+            .execute(
+                "INSERT INTO ranked (id, score, team) VALUES \
+                 (1, 7.5, 'blue'), (2, NULL, 'red'), (3, 9.0, 'blue'), \
+                 (4, 7.5, 'red'), (5, 1.0, 'green')",
+            )
+            .expect("insert");
+
+        let rows = query_rows(
+            &mut session,
+            "SELECT id FROM ranked ORDER BY score DESC, id",
+        );
+        assert_eq!(
+            rows.iter().map(|row| row[0].clone()).collect::<Vec<_>>(),
+            vec![
+                Value::Integer(2),
+                Value::Integer(3),
+                Value::Integer(1),
+                Value::Integer(4),
+                Value::Integer(5),
+            ],
+            "descending puts nulls first, ties break on the second key"
+        );
+
+        let rows = query_rows(&mut session, "SELECT id FROM ranked ORDER BY score LIMIT 2");
+        assert_eq!(
+            rows.iter().map(|row| row[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Integer(5), Value::Integer(1)],
+            "ascending puts nulls last and LIMIT applies after the sort"
+        );
+
+        let rows = query_rows(
+            &mut session,
+            "SELECT id, score FROM ranked WHERE team = 'blue' ORDER BY 0 - id",
+        );
+        assert_eq!(
+            rows.iter().map(|row| row[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Integer(3), Value::Integer(1)],
+            "order keys are full expressions and need not be projected"
+        );
+
+        assert!(
+            session
+                .execute("SELECT id FROM ranked ORDER BY missing")
+                .is_err(),
+            "unknown order keys fail before any row is read"
+        );
+    }
 
     #[test]
     fn catalog_ddl_is_transactional_and_survives_restart() {
