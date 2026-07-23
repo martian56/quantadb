@@ -4,12 +4,14 @@ Protocol v1 is a temporary control protocol for developing the core database.
 
 The server also speaks the PostgreSQL v3 wire protocol on its own listener,
 `127.0.0.1:55432` by default (`QUANTA_PG_LISTEN_ADDRESS`, `off` disables it).
-The simple query protocol is supported: startup, SSL negotiation with a
-polite refusal, trust authentication, `Query`, transactions, and errors with
-SQLSTATE codes, which is enough for psql and drivers that avoid prepared
-statements. The extended query protocol answers with a clear error until it
-is implemented. Result columns map to the `bool`, `int8`, `float8`, and
-`text` OIDs in text format.
+Both Postgres query protocols are supported. Simple: startup, SSL
+negotiation with a polite refusal, trust authentication, `Query`,
+transactions, and errors with SQLSTATE codes. Extended: Parse, Bind,
+Describe, Execute, Close, Flush, and Sync, with text-format parameters
+substituted as quoted literals; binary parameter format is refused with a
+clear error, and an error inside an extended sequence skips messages until
+Sync, as the protocol requires. Result columns map to the `bool`, `int8`,
+`float8`, and `text` OIDs in text format.
 
 ## Framing
 
