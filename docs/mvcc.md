@@ -62,6 +62,23 @@ from the map fall through to the newest generation at or below the read
 snapshot, so a stale index can never hide a newer value or resurrect a
 deleted one.
 
+## Reclamation
+
+After each generation publish, and once at open, a sweep drops versions no
+active or future snapshot can observe. The horizon is the oldest active
+snapshot capped by the published generation: everything above it survives,
+below it only the newest version per key, and a key the generation fully
+covers leaves the map entirely. Live values are then served by the index
+fall-through and deleted keys are simply absent from it.
+
+The version map is therefore a working set over the index rather than the
+whole database history: cold keys cost no memory, tombstones disappear once
+a generation passes them, and the sweep at open keeps a restart from
+resurrecting reclaimed history. An open snapshot pins the history it can
+see, so reclamation waits for long readers rather than breaking them.
+Version pages on disk are not yet recycled; that needs free-page tracking
+in the storage layer.
+
 ## Conflict behavior
 
 The current isolation level is snapshot isolation with first-committer-wins
@@ -78,8 +95,7 @@ not implemented yet.
 - Restart still discovers manifests and rebuilds version history by scanning
   physical pages.
 - Keys and values must fit together in one page payload.
-- Old versions and tombstones are not reclaimed yet.
-- Active snapshots are tracked for future garbage collection but do not yet
-  drive reclamation.
+- Reclamation is in-memory only; version pages on disk wait on storage-level
+  free-page tracking.
 - There is no schema, catalog, secondary index, or SQL execution integration.
 - The on-disk MVCC format is internal and has no stable-upgrade promise yet.
