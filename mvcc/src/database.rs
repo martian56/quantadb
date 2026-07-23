@@ -88,33 +88,79 @@ struct State {
     next_transaction_id: u64,
     next_commit_timestamp: u64,
     visible_through: Timestamp,
-    index_generation: Option<IndexGeneration>,
-    /// Keys with committed versions the published generation may not cover.
+    /// Published index generations, ascending by timestamp then manifest.
+    ///
+    /// The last entry is the newest. Older entries stay until no active
+    /// snapshot could still need them, because a snapshot older than the
+    /// newest generation must read reclaimed keys from a generation at or
+    /// below itself.
+    generations: Vec<IndexGeneration>,
+    /// Keys with committed versions the newest generation may not cover.
     dirty_keys: BTreeSet<Vec<u8>>,
     /// Cumulative count of versions dropped from memory by reclamation.
     reclaimed_versions: u64,
 }
 
 impl State {
-    /// Drop versions no active or future snapshot can observe.
-    ///
-    /// The horizon is the oldest active snapshot capped by the published
-    /// generation. Every version above the horizon survives. Below it, only
-    /// the newest version of each key survives, and even that one goes when
-    /// the generation fully covers the key: live values are served by the
-    /// index fall-through and deleted keys are simply absent from it. Keys
-    /// with pending intents or unpublished commits are never removed.
-    fn reclaim_covered(&mut self) {
-        let Some(generation) = self.index_generation else {
-            return;
-        };
-        let oldest_active = self
-            .active
+    fn latest_generation(&self) -> Option<IndexGeneration> {
+        self.generations.last().copied()
+    }
+
+    /// The newest generation whose snapshot is not newer than `snapshot`.
+    fn generation_at(&self, snapshot: Timestamp) -> Option<IndexGeneration> {
+        self.generations
+            .iter()
+            .rev()
+            .find(|generation| generation.timestamp <= snapshot)
+            .copied()
+    }
+
+    fn oldest_active_snapshot(&self) -> Timestamp {
+        self.active
             .values()
             .min()
             .copied()
-            .unwrap_or(self.visible_through);
-        let horizon = oldest_active.min(generation.timestamp);
+            .unwrap_or(self.visible_through)
+    }
+
+    /// Record a durably committed generation, keeping the ring ordered.
+    fn publish_generation(&mut self, generation: IndexGeneration) {
+        let key = (generation.timestamp, generation.manifest_page_id);
+        let position = self
+            .generations
+            .partition_point(|existing| (existing.timestamp, existing.manifest_page_id) <= key);
+        let duplicate = position > 0 && {
+            let previous = self.generations[position - 1];
+            (previous.timestamp, previous.manifest_page_id) == key
+        };
+        if !duplicate {
+            self.generations.insert(position, generation);
+        }
+    }
+
+    /// Drop versions and generations no active or future snapshot can need.
+    ///
+    /// Versions above the oldest active snapshot always survive; below it,
+    /// only the newest version of each key does. A key leaves the map
+    /// entirely only when the covering generation, the newest one at or
+    /// below the oldest active snapshot, holds its surviving version. Every
+    /// current or future snapshot can then reach that value through a
+    /// generation at or below itself, even after newer versions and newer
+    /// generations exist. Keys with pending intents or unpublished commits
+    /// are never removed. Generations older than the covering one are
+    /// unreachable and leave the ring.
+    fn reclaim_covered(&mut self) {
+        let oldest_active = self.oldest_active_snapshot();
+        if let Some(cover_position) = self
+            .generations
+            .iter()
+            .rposition(|generation| generation.timestamp <= oldest_active)
+        {
+            self.generations.drain(..cover_position);
+        }
+        let cover = self
+            .generation_at(oldest_active)
+            .map(|generation| generation.timestamp);
         let Self {
             versions,
             intents,
@@ -123,14 +169,17 @@ impl State {
             ..
         } = self;
         versions.retain(|key, key_versions| {
-            if let Some(newest_covered) = key_versions
+            if let Some(newest_visible) = key_versions
                 .iter()
-                .rposition(|version| version.timestamp <= horizon)
+                .rposition(|version| version.timestamp <= oldest_active)
             {
-                key_versions.drain(..newest_covered);
-                *reclaimed_versions += newest_covered as u64;
+                key_versions.drain(..newest_visible);
+                *reclaimed_versions += newest_visible as u64;
             }
-            let fully_covered = key_versions.len() == 1 && key_versions[0].timestamp <= horizon;
+            let Some(cover) = cover else {
+                return true;
+            };
+            let fully_covered = key_versions.len() == 1 && key_versions[0].timestamp <= cover;
             if fully_covered && !dirty_keys.contains(key) && !intents.contains_key(key) {
                 *reclaimed_versions += 1;
                 return false;
@@ -215,17 +264,20 @@ impl MvccDatabase {
         let next_commit_timestamp = maximum_timestamp
             .checked_add(1)
             .ok_or(TransactionError::TimestampExhausted)?;
-        let index_generation = index_generations
+        let mut generations = index_generations
             .into_iter()
             .filter(|generation| generation.timestamp.0 <= maximum_timestamp)
-            .max_by_key(|generation| (generation.timestamp, generation.manifest_page_id));
+            .collect::<Vec<_>>();
+        generations
+            .sort_unstable_by_key(|generation| (generation.timestamp, generation.manifest_page_id));
         let committer = GroupCommitter::start(store, options.group_commit)?;
         let storage = committer.handle();
-        if let Some(root) = index_generation.and_then(|generation| generation.root) {
+        if let Some(root) = generations.last().and_then(|generation| generation.root) {
             BPlusTree::range(&storage, None, root, None, None, 1)?;
         }
-        let indexed_through =
-            index_generation.map_or(Timestamp(0), |generation| generation.timestamp);
+        let indexed_through = generations
+            .last()
+            .map_or(Timestamp(0), |generation| generation.timestamp);
         let dirty_keys: BTreeSet<Vec<u8>> = versions
             .iter()
             .filter(|(_, versions)| {
@@ -244,7 +296,7 @@ impl MvccDatabase {
             next_transaction_id: 1,
             next_commit_timestamp,
             visible_through: Timestamp(maximum_timestamp),
-            index_generation,
+            generations,
             dirty_keys,
             reclaimed_versions: 0,
         };
@@ -316,14 +368,14 @@ impl MvccDatabase {
             active_transactions: state.active.len(),
             write_intents: state.intents.len(),
             indexed_through: state
-                .index_generation
+                .latest_generation()
                 .map(|generation| generation.timestamp),
             index_height: state
-                .index_generation
+                .latest_generation()
                 .and_then(|generation| generation.root)
                 .map(|root| root.height),
             indexed_keys: state
-                .index_generation
+                .latest_generation()
                 .and_then(|generation| generation.root)
                 .map_or(0, |root| root.entries),
             reclaimed_versions: state.reclaimed_versions,
@@ -403,7 +455,7 @@ impl Inner {
         let (timestamp, base_generation, live_entries, mutations) = {
             let state = self.lock_state()?;
             let timestamp = state.visible_through;
-            let base_generation = state.index_generation;
+            let base_generation = state.latest_generation();
             if base_generation.is_some_and(|generation| generation.timestamp == timestamp) {
                 return Ok(IndexBuildResult {
                     timestamp,
@@ -441,7 +493,6 @@ impl Inner {
             });
             (timestamp, base_generation, live_entries, mutations)
         };
-
         let plan = if let Some(generation) = base_generation {
             BPlusTree::edit_plan(
                 &self.storage,
@@ -476,13 +527,7 @@ impl Inner {
         self.storage.commit(writes)?;
 
         let mut state = self.lock_state()?;
-        let should_publish = state.index_generation.is_none_or(|current| {
-            (generation.timestamp, generation.manifest_page_id)
-                >= (current.timestamp, current.manifest_page_id)
-        });
-        if should_publish {
-            state.index_generation = Some(generation);
-        }
+        state.publish_generation(generation);
         let State {
             versions,
             dirty_keys,
@@ -499,21 +544,27 @@ impl Inner {
 
     /// Read one key at a snapshot.
     ///
-    /// The in-memory version map is authoritative for every key it holds.
-    /// Only keys absent from the map fall through to the newest persistent
-    /// generation that is not newer than the snapshot.
+    /// The version map answers whenever it holds a version at or below the
+    /// snapshot. Otherwise the newest generation at or below the snapshot
+    /// answers: reclamation only removes versions the covering generation
+    /// holds, and the ring keeps every generation an active snapshot could
+    /// still need, so the value this snapshot saw at begin stays reachable
+    /// even after newer versions and newer generations appear. A key that
+    /// truly did not exist at the snapshot is in neither place, and
+    /// `read_index_version` rejects any record newer than the snapshot as
+    /// corruption.
     fn read(&self, key: &[u8], snapshot: Timestamp) -> Result<Option<Vec<u8>>> {
         let state = self.lock_state()?;
-        if let Some(versions) = state.versions.get(key) {
-            return Ok(versions
+        if let Some(version) = state.versions.get(key).and_then(|versions| {
+            versions
                 .iter()
                 .rev()
                 .find(|version| version.timestamp <= snapshot)
-                .and_then(|version| version.value.clone()));
+        }) {
+            return Ok(version.value.clone());
         }
         let root = state
-            .index_generation
-            .filter(|generation| generation.timestamp <= snapshot)
+            .generation_at(snapshot)
             .map(|generation| generation.root);
         drop(state);
         root.map_or(Ok(None), |root| self.read_indexed(root, key, snapshot))
@@ -792,19 +843,20 @@ impl Transaction {
         let mut masked = BTreeSet::new();
         let mut results = BTreeMap::new();
         for (key, versions) in version_range(&state.versions, prefix) {
-            masked.insert(key.clone());
-            if let Some(value) = versions
+            let Some(version) = versions
                 .iter()
                 .rev()
                 .find(|version| version.timestamp <= self.snapshot)
-                .and_then(|version| version.value.clone())
-            {
+            else {
+                continue;
+            };
+            masked.insert(key.clone());
+            if let Some(value) = version.value.clone() {
                 results.insert(key.clone(), value);
             }
         }
         let root = state
-            .index_generation
-            .filter(|generation| generation.timestamp <= self.snapshot)
+            .generation_at(self.snapshot)
             .and_then(|generation| generation.root);
         drop(state);
 
@@ -1339,6 +1391,60 @@ mod tests {
             vec![(b"keep".to_vec(), b"kept".to_vec())]
         );
         transaction.rollback().expect("rollback");
+        database.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn old_snapshots_read_reclaimed_keys_from_an_older_generation() {
+        let directory = tempdir().expect("tempdir");
+        let database = open_database(directory.path());
+        let mut seed = database.begin().expect("begin seed");
+        seed.put(b"racy", b"first").expect("put racy");
+        seed.commit().expect("commit seed");
+        database.rebuild_index().expect("first rebuild");
+
+        let mut filler = database.begin().expect("begin filler");
+        filler.put(b"other", b"noise").expect("put other");
+        filler.commit().expect("commit filler");
+        database.rebuild_index().expect("second rebuild");
+        assert_eq!(
+            database.stats().expect("stats").keys,
+            0,
+            "with no active snapshots both keys must be fully reclaimed"
+        );
+
+        let reader = database.begin().expect("begin reader");
+        assert_eq!(reader.snapshot(), Timestamp(2));
+
+        let mut rewrite = database.begin().expect("begin rewrite");
+        rewrite.put(b"racy", b"second").expect("rewrite racy");
+        rewrite.commit().expect("commit rewrite");
+        database.rebuild_index().expect("third rebuild");
+
+        assert_eq!(
+            reader.get(b"racy").expect("pinned read"),
+            Some(b"first".to_vec()),
+            "the old snapshot must read the reclaimed version from an older generation"
+        );
+        let scanned = reader.scan_prefix(b"").expect("pinned scan");
+        assert_eq!(
+            scanned,
+            vec![
+                (b"other".to_vec(), b"noise".to_vec()),
+                (b"racy".to_vec(), b"first".to_vec()),
+            ],
+            "the old snapshot's scan must merge map and older generation correctly"
+        );
+        drop(reader);
+
+        let mut unblock = database.begin().expect("begin unblock");
+        unblock.put(b"other", b"final").expect("put unblock");
+        unblock.commit().expect("commit unblock");
+        database.rebuild_index().expect("fourth rebuild");
+        assert_eq!(
+            database.get(b"racy").expect("latest read"),
+            Some(b"second".to_vec())
+        );
         database.shutdown().expect("shutdown");
     }
 
