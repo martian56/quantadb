@@ -473,6 +473,10 @@ impl Inner {
             signal.dirty = false;
             drop(signal);
             let _ = self.rebuild_index();
+            // A short pause coalesces bursts: under sustained commits the
+            // publisher folds many deltas per build instead of contending
+            // for the pipeline after every single one.
+            thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
@@ -556,7 +560,12 @@ impl Inner {
             page_id: manifest_page_id,
             payload: generation.encode(),
         });
-        self.storage.commit(writes)?;
+        // The generation rides the next foreground sync instead of forcing
+        // its own: readers reach the new nodes through the dirty table
+        // right away, and if a crash loses the batch, restart selects the
+        // previous durable manifest and the dirty-key seed rebuilds this
+        // one. Publication therefore adds no fsync to the commit path.
+        self.storage.commit_relaxed(writes)?;
 
         let mut state = self.lock_state()?;
         state.publish_generation(generation);

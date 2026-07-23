@@ -182,6 +182,22 @@ impl DurableStore {
     /// are then appended and synchronized as a group before any data page is
     /// written, preserving the write-ahead rule.
     pub fn write_pages(&mut self, writes: impl IntoIterator<Item = PageWrite>) -> Result<Vec<Lsn>> {
+        self.write_pages_with(writes, true)
+    }
+
+    /// Write a batch, optionally without waiting for the log sync.
+    ///
+    /// A relaxed batch is complete in the log and visible to readers
+    /// through the dirty table, but not durable until the next synced
+    /// batch or checkpoint covers it. Recovery replays only complete
+    /// batches, so a crash simply loses the relaxed batch as a unit.
+    /// Callers must be able to rebuild what they wrote; the index
+    /// publisher can, foreground commits cannot.
+    pub fn write_pages_with(
+        &mut self,
+        writes: impl IntoIterator<Item = PageWrite>,
+        durable: bool,
+    ) -> Result<Vec<Lsn>> {
         if self.poisoned {
             return Err(StorageError::Poisoned);
         }
@@ -193,7 +209,7 @@ impl DurableStore {
             return Ok(Vec::new());
         }
 
-        let result = self.write_pages_inner(&writes);
+        let result = self.write_pages_inner(&writes, durable);
         if result.is_err() {
             self.poisoned = true;
         }
@@ -285,13 +301,15 @@ impl DurableStore {
         result
     }
 
-    fn write_pages_inner(&mut self, writes: &[PageWrite]) -> Result<Vec<Lsn>> {
+    fn write_pages_inner(&mut self, writes: &[PageWrite], durable: bool) -> Result<Vec<Lsn>> {
         let mut lsns = Vec::with_capacity(writes.len());
         for write in writes {
             lsns.push(self.wal.append_page(write.page_id, &write.payload)?);
         }
         self.wal.append_batch_commit(writes.len())?;
-        self.wal.sync()?;
+        if durable {
+            self.wal.sync()?;
+        }
 
         let mut dirty = self
             .dirty

@@ -93,6 +93,7 @@ impl AtomicStats {
 
 struct CommitRequest {
     writes: Vec<PageWrite>,
+    durable: bool,
     response: SyncSender<Result<Vec<Lsn>>>,
 }
 
@@ -175,6 +176,20 @@ impl Drop for GroupCommitter {
 
 impl GroupCommitHandle {
     pub fn commit(&self, writes: Vec<PageWrite>) -> Result<Vec<Lsn>> {
+        self.commit_with(writes, true)
+    }
+
+    /// Commit a batch that rides the next sync instead of forcing one.
+    ///
+    /// The pages become visible to readers immediately and durable when
+    /// any later synced batch or checkpoint lands. A crash before then
+    /// loses the whole batch atomically, so this lane is only for work
+    /// the caller can rebuild, like index generations.
+    pub fn commit_relaxed(&self, writes: Vec<PageWrite>) -> Result<Vec<Lsn>> {
+        self.commit_with(writes, false)
+    }
+
+    fn commit_with(&self, writes: Vec<PageWrite>, durable: bool) -> Result<Vec<Lsn>> {
         if writes.is_empty() {
             return Ok(Vec::new());
         }
@@ -191,6 +206,7 @@ impl GroupCommitHandle {
         self.sender
             .send(Command::Commit(CommitRequest {
                 writes,
+                durable,
                 response: sender,
             }))
             .map_err(|_| StorageError::CommitCoordinatorStopped)?;
@@ -360,10 +376,11 @@ fn execute_group(store: &Mutex<DurableStore>, stats: &AtomicStats, requests: Vec
         .flat_map(|request| request.writes.iter().cloned())
         .collect::<Vec<_>>();
 
+    let durable = requests.iter().any(|request| request.durable);
     let result = store
         .lock()
         .map_err(|_| StorageError::GroupCommit("store mutex is poisoned".to_owned()))
-        .and_then(|mut store| store.write_pages(writes));
+        .and_then(|mut store| store.write_pages_with(writes, durable));
 
     stats.groups.fetch_add(1, Ordering::Relaxed);
     stats
