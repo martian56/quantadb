@@ -1,4 +1,7 @@
-# QuantaSQL Specification v0.1
+# QuantaSQL Specification v0.1 (legacy)
+
+This document describes the original proof-of-concept grammar. It is retained
+for historical reference and does not define the current QuantaDB syntax.
 
 ## Overview
 
