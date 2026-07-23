@@ -76,9 +76,21 @@ Opening a store:
 Checksum corruption before the WAL tail is fatal. Corruption at or before a
 checkpoint remains visible unless a newer WAL image can repair it.
 
+## Checkpoints
+
+A checkpoint synchronizes the data file, appends a checkpoint record,
+synchronizes the log, and then truncates the log to zero bytes. An empty
+log and a log ending in a checkpoint recover identically, so truncation is
+safe at any moment after the checkpoint record is durable, including
+across a crash between the two steps. LSN allocation resumes from the
+newest page LSN in the data file on reopen.
+
+The group commit coordinator checkpoints automatically once the log
+outgrows a configured budget, 64 MiB by default, checked between batches
+so no commit waits on a checkpoint its own batch triggered.
+
 ## Current limitations
 
-- Checkpoints do not recycle WAL segments yet.
 - Page images are physical rather than physiological records.
 - The cache is bounded LRU and write-through; transaction-aware dirty-page
   management and asynchronous flushing remain future work.
