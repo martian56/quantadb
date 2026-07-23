@@ -95,8 +95,16 @@ only one can commit a write to the same key. Disjoint keys can commit
 concurrently and share storage syncs.
 
 There is no lock waiting or deadlock cycle: a conflicting writer fails
-immediately. Serializable isolation and predicate/range conflict tracking are
-not implemented yet.
+immediately.
+
+Range conflicts are opt-in per transaction. `protect_scans` records every
+scanned prefix, and at commit a writing transaction fails with a range
+conflict if any other transaction committed, or holds an intent, under one
+of those prefixes past its snapshot. That is first-committer-wins extended
+to predicates: it closes the phantom window for read-modify-write patterns
+over ranges without slowing transactions that do not ask for it. Read-only
+commits are unaffected because a snapshot read is already consistent. Full
+serializable isolation remains future work.
 
 ## Current limitations
 
