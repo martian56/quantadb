@@ -64,20 +64,28 @@ deleted one.
 
 ## Reclamation
 
-After each generation publish, and once at open, a sweep drops versions no
-active or future snapshot can observe. The horizon is the oldest active
-snapshot capped by the published generation: everything above it survives,
-below it only the newest version per key, and a key the generation fully
-covers leaves the map entirely. Live values are then served by the index
-fall-through and deleted keys are simply absent from it.
+The database keeps a ring of published generations, ascending by timestamp.
+Reads pick the newest generation at or below their snapshot whenever the
+version map has no version at or below it for a key. That rule is what
+makes aggressive reclamation safe: a version can leave memory as long as
+some generation an active snapshot can reach still holds it.
+
+After each generation publish, and once at open, a sweep drops what no
+active or future snapshot can need. Versions above the oldest active
+snapshot always survive; below it only the newest version per key does,
+and a key leaves the map entirely once the covering generation, the newest
+one at or below the oldest active snapshot, holds its surviving version.
+Generations older than the covering one are unreachable and leave the
+ring. Keys with pending intents or unpublished commits are never removed.
 
 The version map is therefore a working set over the index rather than the
 whole database history: cold keys cost no memory, tombstones disappear once
 a generation passes them, and the sweep at open keeps a restart from
 resurrecting reclaimed history. An open snapshot pins the history it can
-see, so reclamation waits for long readers rather than breaking them.
-Version pages on disk are not yet recycled; that needs free-page tracking
-in the storage layer.
+see, so reclamation waits for long readers rather than breaking them, and
+a reclaimed key that is later rewritten still serves its old value to old
+snapshots through the ring. Version pages on disk are not yet recycled;
+that needs free-page tracking in the storage layer.
 
 ## Conflict behavior
 
