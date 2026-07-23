@@ -385,9 +385,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "quantadb-bench"
+version = "0.2.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "quantadb-engine"
 version = "0.2.0"
 dependencies = [
+ "criterion",
  "quantadb-mvcc",
  "quantadb-syntax",
  "serde",
@@ -400,6 +408,7 @@ dependencies = [
 name = "quantadb-index"
 version = "0.2.0"
 dependencies = [
+ "criterion",
  "quantadb-storage",
  "tempfile",
  "thiserror",
@@ -409,6 +418,7 @@ dependencies = [
 name = "quantadb-mvcc"
 version = "0.2.0"
 dependencies = [
+ "criterion",
  "quantadb-index",
  "quantadb-storage",
  "tempfile",

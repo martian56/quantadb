@@ -1,5 +1,5 @@
 [workspace]
-members = ["engine", "index", "mvcc", "server", "storage", "syntax"]
+members = ["bench", "engine", "index", "mvcc", "server", "storage", "syntax"]
 exclude = ["cli-client", "client"]
 resolver = "2"
 
