@@ -54,9 +54,9 @@ cannot grow without bound even when the connection limit is high.
 - Checkpoints and restart recovery
 - Deterministic crash/fault-injection tests
 
-Transaction-aware dirty pages and platform-specific I/O optimization remain
-follow-up work; their absence does not weaken the current write-ahead and
-atomic-batch recovery invariants. The log truncates at checkpoints, which
+Commits synchronize only the log; committed pages stay in a dirty table
+that checkpoints flush, and readers reach pages without touching the lock
+commits hold across their sync. The log truncates at checkpoints, which
 the commit coordinator triggers automatically on a size budget.
 
 ### M3: transactions and indexes — transaction foundation implemented
