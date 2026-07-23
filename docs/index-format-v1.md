@@ -68,17 +68,20 @@ needed, and can collapse a single-child root. Applying several mutations may
 create intermediate roots in memory; the final plan persists only new pages
 reachable from its final root.
 
-MVCC uses these plans at checkpoint time. It derives mutations from versions
-newer than the prior manifest, commits the new paths and manifest atomically,
-and keeps regular transaction commits free to use the group-commit pipeline.
+MVCC uses these plans from its background publisher and at checkpoint time.
+It derives mutations from keys committed since the prior manifest, commits
+the new paths and manifest atomically, and keeps regular transaction commits
+free to use the group-commit pipeline.
 
 ## Current limitations
 
 - Restart still scans physical pages to discover the newest root manifest and
   reconstruct MVCC version history.
 - Old generations are not reclaimed.
-- Regular commits do not update the persistent generation immediately; reads
-  newer than the last checkpoint use the in-memory version map.
+- The published generation follows commits asynchronously; reads newer than
+  the latest generation use the in-memory version map.
+- Node reads go through the group-commit thread without a node cache, which
+  the baseline shows is the dominant cost of an indexed lookup.
 - Values are physical page IDs; covering and composite SQL key encodings will
   be added with the catalog/type layer.
 - Prefix compression and tuned fill factors are not implemented.
