@@ -18,6 +18,15 @@ const NO_PAGE_ID: u64 = u64::MAX;
 /// a file on every append makes each sync journal a size change, which
 /// measured six times slower than syncing data blocks alone.
 const WAL_PREALLOCATE_BYTES: u64 = 64 << 20;
+/// How far ahead of the append position the file is zero-filled.
+///
+/// Reserving length with set_len leaves a sparse file, and writing into a
+/// hole still allocates blocks, which journals metadata on the next sync,
+/// the very cost preallocation exists to avoid. Zero-filling genuinely
+/// allocates, so it happens in windows this size ahead of the log's end:
+/// one bulk write every few thousand records instead of an allocation on
+/// every commit.
+const WAL_ZERO_FILL_AHEAD: u64 = 4 << 20;
 /// Appends end with four zero bytes where the next header would start, so
 /// a sequential scan stops cleanly instead of running into stale records
 /// left over from an earlier lap over the recycled file.
@@ -44,6 +53,8 @@ pub(crate) struct Wal {
     end_offset: u64,
     /// The physical, preallocated size of the file.
     file_length: u64,
+    /// Everything below this offset has truly allocated blocks.
+    allocated_offset: u64,
 }
 
 impl Wal {
@@ -72,6 +83,9 @@ impl Wal {
             next_lsn,
             end_offset,
             file_length,
+            // Blocks up to the scanned end were written before; anything
+            // beyond gets zero-filled ahead of use.
+            allocated_offset: end_offset,
         })
     }
 
@@ -223,6 +237,13 @@ impl Wal {
             self.file.set_len(grown)?;
             self.file_length = grown;
         }
+        if needed > self.allocated_offset {
+            let target = needed
+                .saturating_add(WAL_ZERO_FILL_AHEAD)
+                .min(self.file_length);
+            zero_fill(&self.file, self.allocated_offset, target)?;
+            self.allocated_offset = target;
+        }
 
         write_all_at(&self.file, &header, self.end_offset)?;
         write_all_at(
@@ -235,6 +256,19 @@ impl Wal {
         self.records.push(WalRecord { lsn, kind });
         Ok(lsn)
     }
+}
+
+/// Write real zeros so the blocks are allocated, not holes.
+fn zero_fill(file: &File, from: u64, to: u64) -> Result<()> {
+    const CHUNK: usize = 64 << 10;
+    let zeros = [0_u8; CHUNK];
+    let mut offset = from;
+    while offset < to {
+        let step = ((to - offset) as usize).min(CHUNK);
+        write_all_at(file, &zeros[..step], offset)?;
+        offset += step as u64;
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
