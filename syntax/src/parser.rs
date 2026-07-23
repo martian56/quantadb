@@ -1,8 +1,8 @@
 use crate::{
     tokenize, Assignment, BeginTransaction, BinaryOperator, ColumnDef, Commit, CreateIndex,
     CreateTable, DataType, Delete, DropIndex, DropTable, Expr, Identifier, Insert, Keyword,
-    Literal, Rollback, Select, SelectItem, Span, Statement, SyntaxError, Token, TokenKind,
-    UnaryOperator, Update,
+    Literal, OrderKey, Rollback, Select, SelectItem, Span, Statement, SyntaxError, Token,
+    TokenKind, UnaryOperator, Update,
 };
 
 const MAX_EXPRESSION_DEPTH: usize = 256;
@@ -490,6 +490,34 @@ impl Parser {
         } else {
             None
         };
+
+        let mut order_by = Vec::new();
+        if self.consume_keyword(Keyword::Order).is_some() {
+            self.expect_keyword(Keyword::By)?;
+            loop {
+                let expression = self.parse_expression(0)?;
+                let (descending, key_end) = if let Some(token) = self.consume_keyword(Keyword::Desc)
+                {
+                    (true, token.span)
+                } else if let Some(token) = self.consume_keyword(Keyword::Asc) {
+                    (false, token.span)
+                } else {
+                    (false, expression.span())
+                };
+                order_by.push(OrderKey {
+                    span: expression.span().join(key_end),
+                    expression,
+                    descending,
+                });
+                if self
+                    .consume_punctuation(|kind| matches!(kind, TokenKind::Comma))
+                    .is_none()
+                {
+                    break;
+                }
+            }
+        }
+
         let (limit, end) = if self.consume_keyword(Keyword::Limit).is_some() {
             let token = self.advance();
             let TokenKind::Number(raw_limit) = token.kind else {
@@ -509,7 +537,10 @@ impl Parser {
                 .map_err(|_| SyntaxError::new("LIMIT is out of range", token.span))?;
             (Some(limit), token.span)
         } else {
-            let end = selection.as_ref().map_or(from.span, Expr::span);
+            let end = order_by.last().map_or_else(
+                || selection.as_ref().map_or(from.span, Expr::span),
+                |key| key.span,
+            );
             (None, end)
         };
 
@@ -517,6 +548,7 @@ impl Parser {
             projection,
             from,
             selection,
+            order_by,
             limit,
             span: start.join(end),
         })
@@ -824,6 +856,27 @@ mod tests {
                 max_length: Some(320)
             }
         );
+    }
+
+    #[test]
+    fn parses_order_by_keys_and_directions() {
+        let statement = parse_statement(
+            "SELECT id, balance FROM accounts WHERE active = true \
+             ORDER BY balance DESC, id, created + 1 ASC LIMIT 10",
+        )
+        .expect("SELECT with ORDER BY should parse");
+        let Statement::Select(select) = statement else {
+            panic!("expected SELECT");
+        };
+        assert_eq!(select.order_by.len(), 3);
+        assert!(select.order_by[0].descending);
+        assert!(!select.order_by[1].descending);
+        assert!(!select.order_by[2].descending);
+        assert!(matches!(select.order_by[2].expression, Expr::Binary { .. }));
+        assert_eq!(select.limit, Some(10));
+
+        assert!(parse_statement("SELECT id FROM t ORDER id").is_err());
+        assert!(parse_statement("SELECT id FROM t ORDER BY").is_err());
     }
 
     #[test]

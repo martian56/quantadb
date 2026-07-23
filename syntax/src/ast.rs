@@ -143,7 +143,15 @@ pub struct Select {
     pub projection: Vec<SelectItem>,
     pub from: Identifier,
     pub selection: Option<Expr>,
+    pub order_by: Vec<OrderKey>,
     pub limit: Option<u64>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OrderKey {
+    pub expression: Expr,
+    pub descending: bool,
     pub span: Span,
 }
 
