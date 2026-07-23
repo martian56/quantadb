@@ -1,4 +1,5 @@
 use crate::{
+    cache::NodeCache,
     node::{header_size, internal_entry_size, leaf_entry_size, Node},
     IndexError, Result,
 };
@@ -6,6 +7,7 @@ use quantadb_storage::{GroupCommitHandle, PageId, PageWrite, MAX_PAGE_PAYLOAD};
 use std::{
     collections::{HashMap, HashSet},
     ops::Range,
+    sync::Arc,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +70,7 @@ struct EditFrame {
 
 struct Editor<'a> {
     storage: &'a GroupCommitHandle,
+    cache: Option<&'a NodeCache>,
     root: Option<IndexRoot>,
     overlay: HashMap<PageId, Node>,
 }
@@ -173,11 +176,13 @@ impl BPlusTree {
     /// while applying several mutations are not persisted.
     pub fn edit_plan(
         storage: &GroupCommitHandle,
+        cache: Option<&NodeCache>,
         root: Option<IndexRoot>,
         mutations: impl IntoIterator<Item = IndexMutation>,
     ) -> Result<IndexBuildPlan> {
         let mut editor = Editor {
             storage,
+            cache,
             root,
             overlay: HashMap::new(),
         };
@@ -187,7 +192,12 @@ impl BPlusTree {
         editor.finish()
     }
 
-    pub fn get(storage: &GroupCommitHandle, root: IndexRoot, key: &[u8]) -> Result<Option<PageId>> {
+    pub fn get(
+        storage: &GroupCommitHandle,
+        cache: Option<&NodeCache>,
+        root: IndexRoot,
+        key: &[u8],
+    ) -> Result<Option<PageId>> {
         let mut page_id = root.page_id;
         let mut expected_level = root
             .height
@@ -195,7 +205,7 @@ impl BPlusTree {
             .ok_or_else(|| corrupt(root.page_id, "root height cannot be zero"))?;
 
         loop {
-            let node = read_node(storage, page_id)?;
+            let node = read_node(storage, cache, page_id)?;
             if node.level() != expected_level {
                 return Err(corrupt(
                     page_id,
@@ -205,7 +215,7 @@ impl BPlusTree {
                     ),
                 ));
             }
-            match node {
+            match &*node {
                 Node::Leaf { entries, .. } => {
                     return Ok(entries
                         .binary_search_by(|entry| entry.key.as_slice().cmp(key))
@@ -220,7 +230,7 @@ impl BPlusTree {
                     let child_position =
                         separators.partition_point(|(separator, _)| separator.as_slice() <= key);
                     page_id = if child_position == 0 {
-                        first_child
+                        *first_child
                     } else {
                         separators[child_position - 1].1
                     };
@@ -235,6 +245,7 @@ impl BPlusTree {
     /// Scan `[start, end)` in key order, returning at most `limit` entries.
     pub fn range(
         storage: &GroupCommitHandle,
+        cache: Option<&NodeCache>,
         root: IndexRoot,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
@@ -248,6 +259,7 @@ impl BPlusTree {
         let mut frames = Vec::new();
         let (mut page_id, _) = descend_to_leaf(
             storage,
+            cache,
             root.page_id,
             root.height
                 .checked_sub(1)
@@ -260,7 +272,8 @@ impl BPlusTree {
         let mut previous_key: Option<Vec<u8>> = None;
 
         while result.len() < limit {
-            let Node::Leaf { entries, .. } = read_node(storage, page_id)? else {
+            let node = read_node(storage, cache, page_id)?;
+            let Node::Leaf { entries, .. } = &*node else {
                 return Err(corrupt(page_id, "tree cursor reached an internal node"));
             };
 
@@ -278,13 +291,14 @@ impl BPlusTree {
                     return Err(corrupt(page_id, "leaf chain is not strictly ordered"));
                 }
                 previous_key = Some(entry.key.clone());
-                result.push(entry);
+                result.push(entry.clone());
                 if result.len() == limit {
                     return Ok(result);
                 }
             }
 
-            let Some(next) = advance_to_next_leaf(storage, &mut frames, &mut visited)? else {
+            let Some(next) = advance_to_next_leaf(storage, cache, &mut frames, &mut visited)?
+            else {
                 break;
             };
             page_id = next;
@@ -514,10 +528,10 @@ impl Editor<'_> {
     }
 
     fn read(&self, page_id: PageId) -> Result<Node> {
-        self.overlay
-            .get(&page_id)
-            .cloned()
-            .map_or_else(|| read_node(self.storage, page_id), Ok)
+        if let Some(node) = self.overlay.get(&page_id) {
+            return Ok(node.clone());
+        }
+        Ok(read_node(self.storage, self.cache, page_id)?.as_ref().clone())
     }
 
     fn finish(self) -> Result<IndexBuildPlan> {
@@ -661,6 +675,7 @@ fn partition_by(
 
 fn descend_to_leaf(
     storage: &GroupCommitHandle,
+    cache: Option<&NodeCache>,
     mut page_id: PageId,
     mut expected_level: u16,
     key: Option<&[u8]>,
@@ -671,11 +686,11 @@ fn descend_to_leaf(
         if !visited.insert(page_id) {
             return Err(corrupt(page_id, "index tree contains a page cycle"));
         }
-        let node = read_node(storage, page_id)?;
+        let node = read_node(storage, cache, page_id)?;
         if node.level() != expected_level {
             return Err(corrupt(page_id, "node level does not match tree height"));
         }
-        match node {
+        match &*node {
             Node::Leaf { .. } => return Ok((page_id, expected_level)),
             Node::Internal {
                 first_child,
@@ -683,7 +698,7 @@ fn descend_to_leaf(
                 ..
             } => {
                 let mut children = Vec::with_capacity(separators.len() + 1);
-                children.push(first_child);
+                children.push(*first_child);
                 children.extend(separators.iter().map(|(_, child)| *child));
                 let position = key.map_or(0, |key| {
                     separators.partition_point(|(separator, _)| separator.as_slice() <= key)
@@ -704,6 +719,7 @@ fn descend_to_leaf(
 
 fn advance_to_next_leaf(
     storage: &GroupCommitHandle,
+    cache: Option<&NodeCache>,
     frames: &mut Vec<CursorFrame>,
     visited: &mut HashSet<PageId>,
 ) -> Result<Option<PageId>> {
@@ -712,7 +728,7 @@ fn advance_to_next_leaf(
             frame.position += 1;
             let page_id = frame.children[frame.position];
             let child_level = frame.child_level;
-            return descend_to_leaf(storage, page_id, child_level, None, frames, visited)
+            return descend_to_leaf(storage, cache, page_id, child_level, None, frames, visited)
                 .map(|(page_id, _)| Some(page_id));
         }
         frames.pop();
@@ -720,11 +736,22 @@ fn advance_to_next_leaf(
     Ok(None)
 }
 
-fn read_node(storage: &GroupCommitHandle, page_id: PageId) -> Result<Node> {
+fn read_node(
+    storage: &GroupCommitHandle,
+    cache: Option<&NodeCache>,
+    page_id: PageId,
+) -> Result<Arc<Node>> {
+    if let Some(node) = cache.and_then(|cache| cache.get(page_id)) {
+        return Ok(node);
+    }
     let page = storage
         .read_page(page_id)?
         .ok_or_else(|| corrupt(page_id, "referenced page does not exist"))?;
-    Node::decode(page_id, page.payload())
+    let node = Arc::new(Node::decode(page_id, page.payload())?);
+    if let Some(cache) = cache {
+        cache.insert(page_id, &node);
+    }
+    Ok(node)
 }
 
 fn corrupt(page_id: PageId, reason: impl Into<String>) -> IndexError {
@@ -798,17 +825,18 @@ mod tests {
 
         for position in [0_usize, 1, 400, 4_999] {
             assert_eq!(
-                BPlusTree::get(&handle, root, &source[position].key).expect("get"),
+                BPlusTree::get(&handle, None, root, &source[position].key).expect("get"),
                 Some(source[position].value)
             );
         }
         assert_eq!(
-            BPlusTree::get(&handle, root, b"missing").expect("missing"),
+            BPlusTree::get(&handle, None, root, b"missing").expect("missing"),
             None
         );
 
         let range = BPlusTree::range(
             &handle,
+            None,
             root,
             Some(&source[123].key),
             Some(&source[140].key),
@@ -834,7 +862,7 @@ mod tests {
         {
             let (committer, handle) = open(directory.path());
             assert_eq!(
-                BPlusTree::range(&handle, root, None, None, usize::MAX).expect("scan"),
+                BPlusTree::range(&handle, None, root, None, None, usize::MAX).expect("scan"),
                 source
             );
             committer.shutdown().expect("shutdown");
@@ -863,13 +891,14 @@ mod tests {
 
         for position in (0..source.len()).step_by(37) {
             assert_eq!(
-                BPlusTree::get(&handle, root, &source[position].key).expect("get"),
+                BPlusTree::get(&handle, None, root, &source[position].key).expect("get"),
                 Some(source[position].value)
             );
         }
         for start in (0..source.len() - 20).step_by(113) {
             let actual = BPlusTree::range(
                 &handle,
+                None,
                 root,
                 Some(&source[start].key),
                 Some(&source[start + 20].key),
@@ -891,6 +920,7 @@ mod tests {
             .expect("root");
         let plan = BPlusTree::edit_plan(
             &handle,
+            None,
             Some(root),
             [
                 IndexMutation::Upsert(IndexEntry {
@@ -910,20 +940,21 @@ mod tests {
         handle.commit(plan.into_writes()).expect("commit edit");
 
         assert_eq!(
-            BPlusTree::get(&handle, edited_root, &source[1_234].key).expect("updated get"),
+            BPlusTree::get(&handle, None, edited_root, &source[1_234].key).expect("updated get"),
             Some(PageId(900_001))
         );
         assert_eq!(
-            BPlusTree::get(&handle, edited_root, &source[2_345].key).expect("deleted get"),
+            BPlusTree::get(&handle, None, edited_root, &source[2_345].key).expect("deleted get"),
             None
         );
         assert_eq!(
-            BPlusTree::get(&handle, edited_root, b"key:00001234:after").expect("inserted get"),
+            BPlusTree::get(&handle, None, edited_root, b"key:00001234:after").expect("inserted get"),
             Some(PageId(900_002))
         );
 
         let range = BPlusTree::range(
             &handle,
+            None,
             edited_root,
             Some(b"key:00001233"),
             Some(b"key:00001236"),
@@ -978,10 +1009,10 @@ mod tests {
             }
         }
 
-        let plan = BPlusTree::edit_plan(&handle, Some(root), mutations).expect("edit plan");
+        let plan = BPlusTree::edit_plan(&handle, None, Some(root), mutations).expect("edit plan");
         let edited_root = plan.root().expect("edited root");
         handle.commit(plan.into_writes()).expect("commit edits");
-        let actual = BPlusTree::range(&handle, edited_root, None, None, usize::MAX)
+        let actual = BPlusTree::range(&handle, None, edited_root, None, None, usize::MAX)
             .expect("scan edited tree")
             .into_iter()
             .map(|entry| (entry.key, entry.value))

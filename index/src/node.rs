@@ -31,6 +31,19 @@ impl Node {
         }
     }
 
+    /// Approximate resident size, used for cache accounting.
+    pub(crate) fn approximate_bytes(&self) -> usize {
+        let base = std::mem::size_of::<Self>();
+        match self {
+            Self::Leaf { entries, .. } => entries.iter().fold(base, |bytes, entry| {
+                bytes + entry.key.len() + std::mem::size_of::<IndexEntry>()
+            }),
+            Self::Internal { separators, .. } => separators.iter().fold(base, |bytes, (key, _)| {
+                bytes + key.len() + std::mem::size_of::<(Vec<u8>, PageId)>()
+            }),
+        }
+    }
+
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         let encoded_length = match self {
             Self::Leaf { entries, .. } => {
