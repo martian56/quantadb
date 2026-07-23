@@ -44,12 +44,23 @@ after the greatest durable timestamp. Tombstones are retained as versions.
 
 `rebuild_index` creates an immutable B+ tree for one visible snapshot and
 atomically stores its root manifest with every new node. After the first bulk
-generation, it derives key deltas since the previous manifest and performs
-copy-on-write path updates. Point and prefix reads use a generation only when
-its timestamp exactly matches their snapshot; a later commit automatically
-falls back to the version map, so a stale index cannot hide a newer value.
-`checkpoint` updates the index generation before writing the physical
-checkpoint record.
+generation, rebuilds walk the set of keys committed since the last manifest
+and perform copy-on-write path updates, so publication cost tracks the write
+rate rather than the database size. `checkpoint` updates the index generation
+before writing the physical checkpoint record.
+
+By default a background publisher rebuilds the generation whenever commits
+mark keys dirty, so the persistent index follows the visible timestamp
+without checkpoints. Foreground commits never wait on index builds; both go
+through the same group-commit coordinator and only share storage batches.
+Restart seeds the dirty set from recovered history and catches up
+automatically. `MvccOptions::online_index` disables the publisher for
+callers that want checkpoint-only generations.
+
+The version map is authoritative for every key it holds. Only keys absent
+from the map fall through to the newest generation at or below the read
+snapshot, so a stale index can never hide a newer value or resurrect a
+deleted one.
 
 ## Conflict behavior
 
@@ -65,9 +76,7 @@ not implemented yet.
 ## Current limitations
 
 - Restart still discovers manifests and rebuilds version history by scanning
-  physical pages; the persistent B+ tree accelerates matching-snapshot reads.
-- Persistent generations advance at checkpoints rather than every commit;
-  online publication without serializing the group-commit path remains.
+  physical pages.
 - Keys and values must fit together in one page payload.
 - Old versions and tombstones are not reclaimed yet.
 - Active snapshots are tracked for future garbage collection but do not yet
