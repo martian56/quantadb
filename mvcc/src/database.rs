@@ -62,6 +62,8 @@ pub struct MvccStats {
     pub index_height: Option<u16>,
     pub indexed_keys: u64,
     pub reclaimed_versions: u64,
+    /// Pages currently waiting in the store's free pool for reuse.
+    pub free_pages: usize,
     pub index_cache: NodeCacheStats,
     pub record_cache: ByteCacheStats,
     pub group_commit: GroupCommitStats,
@@ -149,14 +151,27 @@ impl State {
     /// generations exist. Keys with pending intents or unpublished commits
     /// are never removed. Generations older than the covering one are
     /// unreachable and leave the ring.
-    fn reclaim_covered(&mut self) {
+    /// Returns the pages nothing can reference anymore, ready for reuse.
+    ///
+    /// A drained version's page is unreachable: the map no longer holds it,
+    /// and generation entries that still name it are masked by the map
+    /// holding a version at or below every reachable snapshot for that key.
+    /// A pruned generation's manifest page is unreachable because restart
+    /// selection only ever uses the newest manifest. Shared copy-on-write
+    /// index nodes are not freed; that needs reachability tracking.
+    fn reclaim_covered(&mut self) -> Vec<PageId> {
+        let mut freed = Vec::new();
         let oldest_active = self.oldest_active_snapshot();
         if let Some(cover_position) = self
             .generations
             .iter()
             .rposition(|generation| generation.timestamp <= oldest_active)
         {
-            self.generations.drain(..cover_position);
+            freed.extend(
+                self.generations
+                    .drain(..cover_position)
+                    .map(|generation| generation.manifest_page_id),
+            );
         }
         let cover = self
             .generation_at(oldest_active)
@@ -173,7 +188,11 @@ impl State {
                 .iter()
                 .rposition(|version| version.timestamp <= oldest_active)
             {
-                key_versions.drain(..newest_visible);
+                freed.extend(
+                    key_versions
+                        .drain(..newest_visible)
+                        .map(|version| version.page_id),
+                );
                 *reclaimed_versions += newest_visible as u64;
             }
             let Some(cover) = cover else {
@@ -181,11 +200,14 @@ impl State {
             };
             let fully_covered = key_versions.len() == 1 && key_versions[0].timestamp <= cover;
             if fully_covered && !dirty_keys.contains(key) && !intents.contains_key(key) {
+                // The surviving version's page stays live: the covering
+                // generation points at it and serves it after this removal.
                 *reclaimed_versions += 1;
                 return false;
             }
             true
         });
+        freed
     }
 }
 
@@ -306,7 +328,8 @@ impl MvccDatabase {
             dirty_keys,
             reclaimed_versions: 0,
         };
-        state.reclaim_covered();
+        let freed_at_open = state.reclaim_covered();
+        storage.release_pages(freed_at_open)?;
         let inner = Arc::new(Inner {
             state: Mutex::new(state),
             storage,
@@ -387,6 +410,7 @@ impl MvccDatabase {
                 .and_then(|generation| generation.root)
                 .map_or(0, |root| root.entries),
             reclaimed_versions: state.reclaimed_versions,
+            free_pages: self.inner.storage.free_page_count()?,
             index_cache: self.inner.node_cache.stats(),
             record_cache: self.inner.record_cache.stats(),
             group_commit: self.inner.storage.stats(),
@@ -546,7 +570,14 @@ impl Inner {
                 versions.iter().any(|version| version.timestamp > timestamp)
             })
         });
-        state.reclaim_covered();
+        let freed = state.reclaim_covered();
+        drop(state);
+        // Freed pages can be reused with new content, so any cached decode
+        // of their old content has to go before the IDs recirculate.
+        for page_id in &freed {
+            self.record_cache.remove(*page_id);
+        }
+        self.storage.release_pages(freed)?;
         Ok(IndexBuildResult { timestamp, root })
     }
 
@@ -1504,6 +1535,76 @@ mod tests {
             Some(b"second".to_vec())
         );
         database.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn reclaimed_version_pages_are_freed_and_reused() {
+        let directory = tempdir().expect("tempdir");
+        {
+            let database = open_database(directory.path());
+            let mut first = database.begin().expect("begin first");
+            first.put(b"hot", b"v1").expect("put v1");
+            first.commit().expect("commit v1");
+            let mut second = database.begin().expect("begin second");
+            second.put(b"hot", b"v2").expect("put v2");
+            second.commit().expect("commit v2");
+
+            database.rebuild_index().expect("rebuild");
+            let stats = database.stats().expect("stats");
+            assert!(
+                stats.free_pages >= 1,
+                "the drained old version's page must be free: {stats:?}"
+            );
+
+            let free_before = stats.free_pages;
+            let mut third = database.begin().expect("begin third");
+            third.put(b"hot", b"v3").expect("put v3");
+            third.commit().expect("commit v3");
+            let stats = database.stats().expect("stats");
+            assert!(
+                stats.free_pages < free_before,
+                "the new version must have reused a freed page: {stats:?}"
+            );
+            assert_eq!(database.get(b"hot").expect("get"), Some(b"v3".to_vec()));
+            database.shutdown().expect("shutdown");
+        }
+
+        let database = open_database(directory.path());
+        assert_eq!(
+            database.get(b"hot").expect("get after restart"),
+            Some(b"v3".to_vec()),
+            "reuse must survive a restart"
+        );
+        database.shutdown().expect("shutdown reopened");
+    }
+
+    #[test]
+    fn restart_refrees_stale_pages_the_crash_left_behind() {
+        let directory = tempdir().expect("tempdir");
+        {
+            let database = open_database(directory.path());
+            let mut first = database.begin().expect("begin first");
+            first.put(b"key", b"old").expect("put old");
+            first.commit().expect("commit old");
+            let mut second = database.begin().expect("begin second");
+            second.put(b"key", b"new").expect("put new");
+            second.commit().expect("commit new");
+            database
+                .rebuild_index()
+                .expect("rebuild frees the old page");
+            assert!(database.stats().expect("stats").free_pages >= 1);
+            // Shut down without reusing the freed page, like a quiet crash.
+            database.shutdown().expect("shutdown");
+        }
+
+        let database = open_database(directory.path());
+        let stats = database.stats().expect("stats");
+        assert!(
+            stats.free_pages >= 1,
+            "the open sweep must rediscover the stale page as free: {stats:?}"
+        );
+        assert_eq!(database.get(b"key").expect("get"), Some(b"new".to_vec()));
+        database.shutdown().expect("shutdown reopened");
     }
 
     #[test]

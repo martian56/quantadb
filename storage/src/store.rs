@@ -46,6 +46,13 @@ pub struct DurableStore {
     data: DataFile,
     wal: Wal,
     next_page_id: u64,
+    /// Released page IDs waiting for reuse.
+    ///
+    /// Purely in memory: a released page keeps its stale content until a
+    /// new write lands on it through the normal WAL path, so a crash before
+    /// reuse loses nothing and the releasing layer rediscovers the same
+    /// garbage on restart.
+    free_pages: std::collections::BTreeSet<PageId>,
     poisoned: bool,
     _lock: StoreLock,
 }
@@ -78,6 +85,7 @@ impl DurableStore {
             data,
             wal,
             next_page_id: 0,
+            free_pages: std::collections::BTreeSet::new(),
             poisoned: false,
             _lock: lock,
         };
@@ -155,16 +163,41 @@ impl DurableStore {
         if self.poisoned {
             return Err(StorageError::Poisoned);
         }
-        let count = u64::try_from(count).map_err(|_| {
+        let mut page_ids = Vec::with_capacity(count);
+        while page_ids.len() < count {
+            let Some(reused) = self.free_pages.pop_first() else {
+                break;
+            };
+            page_ids.push(reused);
+        }
+        let fresh = u64::try_from(count - page_ids.len()).map_err(|_| {
             StorageError::Configuration("page reservation count exceeds u64".to_owned())
         })?;
         let end = self
             .next_page_id
-            .checked_add(count)
+            .checked_add(fresh)
             .ok_or_else(|| StorageError::Configuration("page ID space exhausted".to_owned()))?;
-        let page_ids = (self.next_page_id..end).map(PageId).collect();
+        page_ids.extend((self.next_page_id..end).map(PageId));
         self.next_page_id = end;
         Ok(page_ids)
+    }
+
+    /// Return pages to the free pool for reuse by later reservations.
+    ///
+    /// The caller vouches that nothing can reference these pages anymore.
+    /// Their stale content stays on disk until a new write overwrites it,
+    /// which keeps the release itself crash-free by construction.
+    pub fn release_pages(&mut self, pages: impl IntoIterator<Item = PageId>) {
+        for page_id in pages {
+            if page_id.0 < self.next_page_id {
+                self.free_pages.insert(page_id);
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn free_page_count(&self) -> usize {
+        self.free_pages.len()
     }
 
     /// Establish a recovery boundary after all preceding data pages are synced.
@@ -571,6 +604,38 @@ mod tests {
         );
         let third = store.allocate_page(b"fresh".to_vec()).expect("allocate");
         assert_eq!(third, PageId(3), "page IDs continue past the truncation");
+    }
+
+    #[test]
+    fn released_pages_are_reused_before_fresh_ones() {
+        let directory = tempdir().expect("tempdir");
+        let mut store =
+            DurableStore::open(directory.path(), StoreOptions::default()).expect("open");
+        for fill in 0..3_u8 {
+            store.allocate_page(vec![fill; 8]).expect("allocate");
+        }
+        store.release_pages([PageId(1)]);
+        assert_eq!(store.free_page_count(), 1);
+
+        let reserved = store.reserve_page_ids(2).expect("reserve");
+        assert_eq!(
+            reserved,
+            vec![PageId(1), PageId(3)],
+            "the released page comes back first, then a fresh one"
+        );
+        assert_eq!(store.free_page_count(), 0);
+
+        store
+            .write_page(PageId(1), b"reused".to_vec())
+            .expect("write reused page");
+        assert_eq!(
+            store
+                .read_page(PageId(1))
+                .expect("read")
+                .expect("page")
+                .payload(),
+            b"reused"
+        );
     }
 
     #[test]

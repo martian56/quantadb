@@ -200,6 +200,23 @@ impl GroupCommitHandle {
             .reserve_page_ids(count)
     }
 
+    /// Return unreachable pages to the store's free pool.
+    pub fn release_pages(&self, pages: impl IntoIterator<Item = PageId>) -> Result<()> {
+        self.store
+            .lock()
+            .map_err(|_| StorageError::GroupCommit("store mutex is poisoned".to_owned()))?
+            .release_pages(pages);
+        Ok(())
+    }
+
+    pub fn free_page_count(&self) -> Result<usize> {
+        Ok(self
+            .store
+            .lock()
+            .map_err(|_| StorageError::GroupCommit("store mutex is poisoned".to_owned()))?
+            .free_page_count())
+    }
+
     pub fn checkpoint(&self) -> Result<Lsn> {
         let (sender, receiver) = mpsc::sync_channel(0);
         self.sender
