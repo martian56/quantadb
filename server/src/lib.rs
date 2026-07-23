@@ -5,6 +5,7 @@
 
 mod config;
 mod error;
+pub mod http;
 pub mod pg;
 pub mod protocol;
 mod server;

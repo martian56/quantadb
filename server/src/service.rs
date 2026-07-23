@@ -71,7 +71,7 @@ impl RequestSession for EngineSession {
     }
 }
 
-fn map_output(output: StatementOutput) -> StatementResult {
+pub(crate) fn map_output(output: StatementOutput) -> StatementResult {
     match output {
         StatementOutput::Transaction(state) => StatementResult::Transaction {
             state: match state {
@@ -123,7 +123,7 @@ fn logical_type_name(data_type: &LogicalType) -> String {
     }
 }
 
-fn map_engine_error(error: EngineError) -> Response {
+pub(crate) fn map_engine_error(error: EngineError) -> Response {
     match error {
         EngineError::Syntax { message, span } => syntax_error(&message, span),
         error @ (EngineError::TransactionAlreadyActive

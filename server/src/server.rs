@@ -336,6 +336,7 @@ mod tests {
         ServerConfig {
             listen_address: "127.0.0.1:0".parse().expect("test address"),
             pg_listen_address: None,
+            http_listen_address: None,
             data_directory: "unused-test-data".into(),
             max_connections: 8,
             max_in_flight_requests: 8,
