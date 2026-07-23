@@ -94,6 +94,42 @@ impl Wal {
         &self.records
     }
 
+    pub(crate) fn size_bytes(&self) -> Result<u64> {
+        Ok(self.file.metadata()?.len())
+    }
+
+    /// Discard the whole log after a checkpoint is durable.
+    ///
+    /// Everything before a durable checkpoint is dead weight: the data pages
+    /// it protects are already synced, and recovery starts at the newest
+    /// checkpoint anyway. An empty log and a log ending in a checkpoint
+    /// recover identically, so truncation is safe at any moment after the
+    /// checkpoint record reaches disk. In-memory LSN allocation continues
+    /// unchanged, and a reopen recovers it from the data pages.
+    pub(crate) fn reset_after_checkpoint(&mut self) -> Result<()> {
+        self.file.set_len(0)?;
+        self.file.sync_all()?;
+        self.file.seek(SeekFrom::End(0))?;
+        self.records.clear();
+        self.records.shrink_to_fit();
+        Ok(())
+    }
+
+    /// Drop in-memory records recovery can no longer need.
+    ///
+    /// Replay only reads records after the newest checkpoint, so everything
+    /// up to and including it can leave memory once recovery has run. The
+    /// on-disk log is untouched.
+    pub(crate) fn trim_records_to_last_checkpoint(&mut self) {
+        if let Some(position) = self
+            .records
+            .iter()
+            .rposition(|record| matches!(record.kind, WalKind::Checkpoint))
+        {
+            self.records.drain(..=position);
+        }
+    }
+
     pub(crate) fn ensure_next_lsn_after(&mut self, durable_lsn: u64) -> Result<()> {
         self.next_lsn = self.next_lsn.max(durable_lsn.checked_add(1).ok_or_else(|| {
             StorageError::CorruptWal {

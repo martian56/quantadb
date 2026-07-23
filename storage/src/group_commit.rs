@@ -14,6 +14,12 @@ pub struct GroupCommitOptions {
     pub queue_depth: usize,
     pub max_batch_pages: usize,
     pub max_delay: Duration,
+    /// Checkpoint and truncate the WAL once it grows past this size.
+    ///
+    /// Zero disables automatic checkpoints; explicit `checkpoint` calls
+    /// still work. The check runs after each committed batch, so the log
+    /// can overshoot by at most one batch.
+    pub checkpoint_after_wal_bytes: u64,
 }
 
 impl Default for GroupCommitOptions {
@@ -22,6 +28,7 @@ impl Default for GroupCommitOptions {
             queue_depth: 1_024,
             max_batch_pages: 256,
             max_delay: Duration::from_micros(200),
+            checkpoint_after_wal_bytes: 64 << 20,
         }
     }
 }
@@ -52,6 +59,7 @@ pub struct GroupCommitStats {
     pub groups: u64,
     pub requests: u64,
     pub pages: u64,
+    pub automatic_checkpoints: u64,
 }
 
 #[derive(Default)]
@@ -59,6 +67,7 @@ struct AtomicStats {
     groups: AtomicU64,
     requests: AtomicU64,
     pages: AtomicU64,
+    automatic_checkpoints: AtomicU64,
 }
 
 impl AtomicStats {
@@ -67,6 +76,7 @@ impl AtomicStats {
             groups: self.groups.load(Ordering::Relaxed),
             requests: self.requests.load(Ordering::Relaxed),
             pages: self.pages.load(Ordering::Relaxed),
+            automatic_checkpoints: self.automatic_checkpoints.load(Ordering::Relaxed),
         }
     }
 }
@@ -246,6 +256,7 @@ fn commit_worker(
                     }
                 }
                 execute_group(&store, &stats, requests);
+                maybe_checkpoint(&store, &stats, &options);
             }
             Command::Checkpoint(response) => {
                 let result = store
@@ -259,6 +270,31 @@ fn commit_worker(
                 return;
             }
         }
+    }
+}
+
+/// Truncate the log once it outgrows the configured budget.
+///
+/// Runs on the worker thread between batches, so no commit ever waits on a
+/// checkpoint that its own batch triggered. A failed checkpoint poisons the
+/// store, which makes the next commit fail loudly instead of silently
+/// running with an unbounded log.
+fn maybe_checkpoint(
+    store: &Mutex<DurableStore>,
+    stats: &AtomicStats,
+    options: &GroupCommitOptions,
+) {
+    if options.checkpoint_after_wal_bytes == 0 {
+        return;
+    }
+    let Ok(mut store) = store.lock() else {
+        return;
+    };
+    let oversized = store
+        .wal_size_bytes()
+        .is_ok_and(|size| size >= options.checkpoint_after_wal_bytes);
+    if oversized && store.checkpoint().is_ok() {
+        stats.automatic_checkpoints.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -317,6 +353,45 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn oversized_logs_trigger_automatic_checkpoints() {
+        let directory = tempdir().expect("tempdir");
+        let store =
+            DurableStore::open(directory.path(), StoreOptions::default()).expect("open store");
+        let coordinator = GroupCommitter::start(
+            store,
+            GroupCommitOptions {
+                checkpoint_after_wal_bytes: 4096,
+                ..GroupCommitOptions::default()
+            },
+        )
+        .expect("coordinator");
+        let handle = coordinator.handle();
+
+        for page_id in 0..8_u64 {
+            handle
+                .commit(vec![PageWrite {
+                    page_id: PageId(page_id),
+                    payload: vec![0x2b; 2048],
+                }])
+                .expect("commit");
+        }
+
+        let stats = handle.stats();
+        assert!(
+            stats.automatic_checkpoints > 0,
+            "the worker must have checkpointed at least once: {stats:?}"
+        );
+        for page_id in 0..8_u64 {
+            let page = handle
+                .read_page(PageId(page_id))
+                .expect("read")
+                .expect("page");
+            assert_eq!(page.payload()[0], 0x2b);
+        }
+        coordinator.shutdown().expect("shutdown");
+    }
+
+    #[test]
     fn concurrent_requests_are_combined_into_fewer_sync_groups() {
         let directory = tempdir().expect("tempdir");
         let store =
@@ -327,6 +402,7 @@ mod tests {
                 queue_depth: 32,
                 max_batch_pages: 32,
                 max_delay: Duration::from_millis(25),
+                ..GroupCommitOptions::default()
             },
         )
         .expect("coordinator");

@@ -85,6 +85,7 @@ impl DurableStore {
         let maximum_page_lsn = store.data.max_lsn()?;
         store.wal.ensure_next_lsn_after(maximum_page_lsn)?;
         store.next_page_id = store.calculate_next_page_id()?;
+        store.wal.trim_records_to_last_checkpoint();
         Ok(store)
     }
 
@@ -199,7 +200,13 @@ impl DurableStore {
         self.data.sync()?;
         let lsn = self.wal.append_checkpoint()?;
         self.wal.sync()?;
+        self.wal.reset_after_checkpoint()?;
         Ok(lsn)
+    }
+
+    /// Current size of the log on disk, which only a checkpoint shrinks.
+    pub fn wal_size_bytes(&self) -> Result<u64> {
+        self.wal.size_bytes()
     }
 
     fn recover(&mut self) -> Result<()> {
@@ -497,6 +504,7 @@ mod tests {
         }
         {
             let mut wal = Wal::open(&directory.path().join(WAL_FILE_NAME)).expect("open WAL");
+            wal.ensure_next_lsn_after(1).expect("resume LSNs");
             wal.append_page(PageId(1), b"after").expect("append");
             wal.append_batch_commit(1).expect("commit");
             wal.sync().expect("sync");
@@ -512,6 +520,57 @@ mod tests {
                 .payload(),
             b"after"
         );
+    }
+
+    #[test]
+    fn checkpoints_truncate_the_log_and_recovery_still_works() {
+        let directory = tempdir().expect("tempdir");
+        let wal_path = directory.path().join(WAL_FILE_NAME);
+        {
+            let mut store =
+                DurableStore::open(directory.path(), StoreOptions::default()).expect("open");
+            store
+                .write_page(PageId(1), b"kept".to_vec())
+                .expect("write");
+            assert!(
+                store.wal_size_bytes().expect("size") > 0,
+                "the log must grow before the checkpoint"
+            );
+            store.checkpoint().expect("checkpoint");
+            assert_eq!(
+                store.wal_size_bytes().expect("size"),
+                0,
+                "a checkpoint must leave an empty log"
+            );
+            store
+                .write_page(PageId(2), b"later".to_vec())
+                .expect("write after checkpoint");
+        }
+        assert!(
+            std::fs::metadata(&wal_path).expect("metadata").len() > 0,
+            "post-checkpoint writes land in the fresh log"
+        );
+
+        let mut store =
+            DurableStore::open(directory.path(), StoreOptions::default()).expect("reopen");
+        assert_eq!(
+            store
+                .read_page(PageId(1))
+                .expect("read kept")
+                .expect("page")
+                .payload(),
+            b"kept"
+        );
+        assert_eq!(
+            store
+                .read_page(PageId(2))
+                .expect("read later")
+                .expect("page")
+                .payload(),
+            b"later"
+        );
+        let third = store.allocate_page(b"fresh".to_vec()).expect("allocate");
+        assert_eq!(third, PageId(3), "page IDs continue past the truncation");
     }
 
     #[test]
