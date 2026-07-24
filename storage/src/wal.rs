@@ -126,13 +126,14 @@ impl Segment {
             self.allocated_offset = target;
         }
 
-        write_all_at(&self.file, header, self.end_offset)?;
-        write_all_at(
-            &self.file,
-            payload,
-            self.end_offset + WAL_HEADER_SIZE as u64,
-        )?;
-        write_all_at(&self.file, &STOP_MARKER, record_end)?;
+        // One write, not three. A commit group logs a record per page, so
+        // splitting header, payload and marker apart tripled the syscalls
+        // on the one path every commit waits behind.
+        let mut framed = Vec::with_capacity(record_length as usize + STOP_MARKER.len());
+        framed.extend_from_slice(header);
+        framed.extend_from_slice(payload);
+        framed.extend_from_slice(&STOP_MARKER);
+        write_all_at(&self.file, &framed, self.end_offset)?;
         self.end_offset = record_end;
         Ok(())
     }
