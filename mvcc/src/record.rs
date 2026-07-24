@@ -61,7 +61,31 @@ impl VersionRecord {
         Ok(bytes)
     }
 
-    pub(crate) fn decode(page_id: PageId, bytes: &[u8]) -> Result<Option<Self>> {
+    /// Every record a page holds, in the order they were appended.
+    ///
+    /// A page packs many records back to back, so decoding walks it until
+    /// the bytes stop looking like one. Trailing zeroes are the unused tail
+    /// of a page that is not full yet, not corruption.
+    pub(crate) fn decode_page(page_id: PageId, bytes: &[u8]) -> Result<Vec<Self>> {
+        let mut records = Vec::new();
+        let mut cursor = 0_usize;
+        while let Some((record, length)) = Self::decode_at(page_id, bytes, cursor)? {
+            records.push(record);
+            cursor += length;
+        }
+        Ok(records)
+    }
+
+    /// Decode the record starting at `offset`, with the length it occupied.
+    pub(crate) fn decode_at(
+        page_id: PageId,
+        page: &[u8],
+        offset: usize,
+    ) -> Result<Option<(Self, usize)>> {
+        let bytes = match page.get(offset..) {
+            Some(bytes) => bytes,
+            None => return Ok(None),
+        };
         if bytes.len() < 4 || bytes[0..4] != MAGIC {
             return Ok(None);
         }
@@ -95,7 +119,7 @@ impl VersionRecord {
             .checked_add(key_length)
             .and_then(|length| length.checked_add(value_length))
             .ok_or_else(|| corrupt(page_id, "record length overflow"))?;
-        if expected_length != bytes.len() {
+        if expected_length > bytes.len() {
             return Err(corrupt(
                 page_id,
                 format!(
@@ -109,12 +133,15 @@ impl VersionRecord {
             return Err(corrupt(page_id, "tombstone contains a value"));
         }
         let key = bytes[HEADER_SIZE..HEADER_SIZE + key_length].to_vec();
-        let value = (!tombstone).then(|| bytes[HEADER_SIZE + key_length..].to_vec());
-        Ok(Some(Self {
-            timestamp: Timestamp(timestamp),
-            key,
-            value,
-        }))
+        let value = (!tombstone).then(|| bytes[HEADER_SIZE + key_length..expected_length].to_vec());
+        Ok(Some((
+            Self {
+                timestamp: Timestamp(timestamp),
+                key,
+                value,
+            },
+            expected_length,
+        )))
     }
 }
 
@@ -176,8 +203,9 @@ mod tests {
                 value,
             };
             assert_eq!(
-                VersionRecord::decode(PageId(4), &record.encode().expect("encode"))
-                    .expect("decode"),
+                VersionRecord::decode_at(PageId(4), &record.encode().expect("encode"), 0)
+                    .expect("decode")
+                    .map(|(decoded, _)| decoded),
                 Some(record)
             );
         }
@@ -203,7 +231,7 @@ mod tests {
         let mut encoded = record.encode().expect("encode");
         encoded[RESERVED_OFFSET] = 1;
         assert!(matches!(
-            VersionRecord::decode(PageId(8), &encoded),
+            VersionRecord::decode_at(PageId(8), &encoded, 0),
             Err(TransactionError::CorruptRecord {
                 page_id: PageId(8),
                 ..

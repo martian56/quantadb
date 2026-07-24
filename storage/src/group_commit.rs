@@ -1,7 +1,6 @@
 use crate::{
     store::{BackgroundCheckpoint, PageAllocator, SharedReader},
-    DurableStore, Lsn, Page, PageAppend, PageId, PageWrite, Result, StorageError,
-    MAX_PAGE_PAYLOAD,
+    DurableStore, Lsn, Page, PageAppend, PageId, PageWrite, Result, StorageError, MAX_PAGE_PAYLOAD,
 };
 use std::{
     sync::{
@@ -483,10 +482,8 @@ fn execute_group(store: &Mutex<DurableStore>, stats: &AtomicStats, requests: Vec
 
     match result {
         Ok((write_lsns, append_lsns)) => {
-            for ((request, writes), appends) in requests
-                .into_iter()
-                .zip(write_spans)
-                .zip(append_spans)
+            for ((request, writes), appends) in
+                requests.into_iter().zip(write_spans).zip(append_spans)
             {
                 let lsns = if request.appends.is_empty() {
                     write_lsns[writes.0..writes.1].to_vec()

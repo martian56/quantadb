@@ -478,13 +478,13 @@ impl DurableStore {
                         .get(&append.page_id)
                         .map(|page| page.payload().to_vec())
                 };
-                let base = match cached {
-                    Some(payload) => payload,
-                    None => self
-                        .data
+                let base = if let Some(payload) = cached {
+                    payload
+                } else {
+                    self.data
                         .read(append.page_id)?
                         .map(|page| page.payload().to_vec())
-                        .unwrap_or_default(),
+                        .unwrap_or_default()
                 };
                 slot.insert(base);
             }
@@ -1090,8 +1090,8 @@ mod tests {
             store
                 .append_pages([PageAppend {
                     page_id: PageId(5),
-                    offset: 4,
-                    payload: b"second".to_vec(),
+                    offset: 10,
+                    payload: b"third".to_vec(),
                     sealed: false,
                 }])
                 .expect("append tail first");
@@ -1099,7 +1099,7 @@ mod tests {
                 .append_pages([PageAppend {
                     page_id: PageId(5),
                     offset: 0,
-                    payload: b"1st/".to_vec(),
+                    payload: b"1st/second".to_vec(),
                     sealed: false,
                 }])
                 .expect("append head second");
@@ -1113,7 +1113,7 @@ mod tests {
                 .expect("read")
                 .expect("page")
                 .payload(),
-            b"1st/second",
+            b"1st/secondthird",
             "each record replays at its own offset regardless of log order"
         );
     }
