@@ -34,8 +34,24 @@ const STOP_MARKER: [u8; 4] = [0; 4];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WalKind {
-    PageImage { page_id: PageId, payload: Vec<u8> },
-    BatchCommit { page_count: u32 },
+    PageImage {
+        page_id: PageId,
+        payload: Vec<u8>,
+    },
+    /// Bytes to place at a known offset inside a page.
+    ///
+    /// Packing many small records into one page would otherwise make the
+    /// log quadratic, since every addition would have to log the whole
+    /// page again. The offset is explicit so two writers filling the same
+    /// page cannot corrupt it by reaching the log out of order.
+    PageAppend {
+        page_id: PageId,
+        offset: u32,
+        payload: Vec<u8>,
+    },
+    BatchCommit {
+        page_count: u32,
+    },
     Checkpoint,
 }
 
@@ -239,6 +255,25 @@ impl Wal {
         })
     }
 
+    pub(crate) fn append_page_tail(
+        &mut self,
+        page_id: PageId,
+        offset: u32,
+        payload: &[u8],
+    ) -> Result<Lsn> {
+        if payload.len() > MAX_PAGE_PAYLOAD {
+            return Err(StorageError::PageTooLarge {
+                actual: payload.len(),
+                maximum: MAX_PAGE_PAYLOAD,
+            });
+        }
+        self.append(WalKind::PageAppend {
+            page_id,
+            offset,
+            payload: payload.to_vec(),
+        })
+    }
+
     pub(crate) fn append_checkpoint(&mut self) -> Result<Lsn> {
         self.append(WalKind::Checkpoint)
     }
@@ -321,6 +356,16 @@ impl Wal {
 
         let (record_type, page_id, payload): (u8, u64, Vec<u8>) = match &kind {
             WalKind::PageImage { page_id, payload } => (1, page_id.0, payload.clone()),
+            WalKind::PageAppend {
+                page_id,
+                offset,
+                payload,
+            } => {
+                let mut framed = Vec::with_capacity(4 + payload.len());
+                framed.extend_from_slice(&offset.to_le_bytes());
+                framed.extend_from_slice(payload);
+                (4, page_id.0, framed)
+            }
             WalKind::BatchCommit { page_count } => {
                 (2, NO_PAGE_ID, page_count.to_le_bytes().to_vec())
             }
@@ -495,6 +540,11 @@ fn scan_and_repair(file: &File) -> Result<(Vec<WalRecord>, u64)> {
                 WalKind::BatchCommit { page_count }
             }
             3 if page_id == NO_PAGE_ID && payload.is_empty() => WalKind::Checkpoint,
+            4 if page_id != NO_PAGE_ID && payload.len() >= 4 => WalKind::PageAppend {
+                page_id: PageId(page_id),
+                offset: read_u32(&payload, 0),
+                payload: payload[4..].to_vec(),
+            },
             _ => break,
         };
         previous_lsn = lsn;

@@ -18,4 +18,4 @@ pub use byte_lru::{ByteCacheStats, SharedByteLru};
 pub use error::{Result, StorageError};
 pub use group_commit::{GroupCommitHandle, GroupCommitOptions, GroupCommitStats, GroupCommitter};
 pub use page::{Lsn, Page, PageId, MAX_PAGE_PAYLOAD, PAGE_SIZE};
-pub use store::{DurableStore, PageWrite, StoreOptions};
+pub use store::{DurableStore, PageAppend, PageWrite, StoreOptions};
