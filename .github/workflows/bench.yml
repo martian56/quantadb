@@ -175,11 +175,31 @@ jobs:
           echo "$run" | python -c "import json,sys; print(json.load(sys.stdin)['headSha'])" > baseline-sha.txt
           gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
             --pattern 'result-*' --dir baseline || echo "baseline artifacts expired"
+      - name: Fetch field reference
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow reference.yml \
+            --status success --limit 1 \
+            --json databaseId,headSha,updatedAt -q '.[0]' || true)
+          if [ -z "$run" ] || [ "$run" = "null" ]; then
+            echo "no reference run yet"
+            exit 0
+          fi
+          run_id=$(echo "$run" | python -c "import json,sys; print(json.load(sys.stdin)['databaseId'])")
+          echo "$run" | python -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          print(data['updatedAt'][:10], '@', data['headSha'][:9])
+          " > reference-stamp.txt
+          gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'reference-*' --dir reference || echo "reference artifacts expired"
       - name: Build report
         shell: bash
         run: |
           sha=$(cat baseline-sha.txt 2>/dev/null || echo "")
-          python .github/scripts/bench_report.py results baseline comment.md "$sha"
+          stamp=$(cat reference-stamp.txt 2>/dev/null || echo "never")
+          python .github/scripts/bench_report.py results baseline comment.md "$sha" reference "$stamp"
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
       - name: Post sticky comment
         if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
