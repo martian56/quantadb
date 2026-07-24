@@ -37,18 +37,18 @@ on the same runners with one shared driver. The tables below are rewritten
 by CI from the newest run on main, so they are current, not curated.
 
 <!-- bench:start -->
-Measured on main at `74d790843`.
+Measured on main at `5af8eaf4c`.
 
 QuantaDB on GitHub runners, loadgen native protocol, 10 seconds per
 workload at 4 connections:
 
 | profile | reads ops/s | mixed ops/s | writes ops/s | write p99 ms |
 |---|---:|---:|---:|---:|
-| linux-arm64-full | 33247 | 13724 | 3046 | 20.4 |
-| linux-x64-1cpu-1gb | 16138 | 8424 | 2591 | 11.3 |
-| linux-x64-2cpu-2gb | 17243 | 11078 | 4841 | 3.1 |
-| linux-x64-full | 23961 | 12713 | 4819 | 5.6 |
-| windows-x64-full | 26393 | 6239 | 530 | 34.7 |
+| linux-arm64-full | 30908 | 13965 | 4110 | 11.2 |
+| linux-x64-1cpu-1gb | 16279 | 8992 | 4758 | 4.6 |
+| linux-x64-2cpu-2gb | 17316 | 11312 | 4826 | 3.4 |
+| linux-x64-full | 24586 | 13643 | 4961 | 4.5 |
+| windows-x64-full | 22712 | 7162 | 656 | 16.3 |
 
 The field at 2 CPUs and 2 GiB, identical containers, one shared
 driver through each engine's Postgres or MySQL port, measured 2026-07-24:
