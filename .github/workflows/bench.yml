@@ -103,7 +103,8 @@ jobs:
               -v "$PWD/bin:/app:ro" \
               ubuntu:24.04 /app/quantadb-server
           else
-            server=$(ls bin/quantadb-server bin/quantadb-server.exe 2>/dev/null | head -1)
+            server=bin/quantadb-server
+            [ -f "$server" ] || server=bin/quantadb-server.exe
             QUANTA_DATA_DIR="$RUNNER_TEMP/qdata" \
             QUANTA_PG_LISTEN_ADDRESS=off \
             QUANTA_HTTP_LISTEN_ADDRESS=off \
@@ -122,7 +123,8 @@ jobs:
       - name: Run workloads
         shell: bash
         run: |
-          loadgen=$(ls bin/loadgen bin/loadgen.exe 2>/dev/null | head -1)
+          loadgen=bin/loadgen
+          [ -f "$loadgen" ] || loadgen=bin/loadgen.exe
           run_pass() {
             "$loadgen" --seconds 10 --connections 4 --rows 5000 --read-percent "$2" > pass.txt
             cat pass.txt
