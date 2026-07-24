@@ -11,28 +11,46 @@ The old v0.1 proof of concept remains available in Git history. The current
 `0.2.0` codebase is a clean foundation and is **not yet a database you should
 use for data storage**.
 
-## Current milestone
+## What is here
 
-The repository currently contains:
+- `syntax/`: a dependency-light, span-aware SQL lexer, AST, and parser
+- `storage/`: checksummed pages, a two-segment physical WAL with group
+  commit and background checkpointing, recovery, and bounded caching
+- `index/`: persistent immutable B+ tree generations for point and range
+  access, published online by a background worker
+- `mvcc/`: durable snapshot transactions with first-committer-wins
+  conflicts; single-statement conflicts are retried on a fresh snapshot
+  server side
+- `engine/`: durable relational catalog, constraints, and transactional CRUD
+- `server/`: a bounded, concurrent, versioned TCP protocol server with a
+  PostgreSQL wire listener, so `psql` and stock Postgres drivers work
+- `docs/`: syntax, protocol, and architecture documentation
 
-- `syntax/` — a dependency-light, span-aware SQL lexer, AST, and parser;
-- `storage/` — checksummed pages, physical WAL, recovery, and bounded caching;
-- `index/` — persistent immutable B+ tree generations for point/range access;
-- `mvcc/` — durable snapshot transactions with first-committer-wins conflicts;
-- `engine/` — durable relational catalog, constraints, and transactional CRUD;
-- `server/` — a bounded, concurrent, versioned TCP protocol server;
-- `docs/` — syntax, protocol, and architecture documentation.
+The current focus is write-path performance: keeping checkpoint work off the
+commit lane entirely and shrinking what each commit has to log.
 
-The server exposes health, SQL parsing, and transactional SQL execution.
-Connection-scoped `BEGIN`/`COMMIT` state is isolated across clients and all
-engine work is admitted through a bounded blocking-work pool.
+## Performance
 
-The current development focus is finishing M3: online generation publication,
-version reclamation, and stronger concurrent history checking.
+Every pull request is benched on five machine profiles against the latest
+main baseline, and the field (PostgreSQL, MySQL, MariaDB) is measured weekly
+on the same runners with one shared driver. The tables below are rewritten
+by CI from the newest run on main, so they are current, not curated.
+
+<!-- bench:start -->
+Numbers appear here after the next merge to main.
+<!-- bench:end -->
+
+Read latencies are the headline: QuantaDB serves reads without touching the
+commit path, so read p99 stays sub-millisecond even while writers sync.
+Writes are honest work in progress; the gap to Postgres on fast storage is
+tracked in the issues, with the measurements attached.
+
+See [the benchmark guide](docs/benchmarks.md) for the methodology, including
+why single-profile swings are treated as noise.
 
 ## Build and test
 
-Rust 1.85 or newer is required.
+Rust 1.96 or newer is required.
 
 ```bash
 cargo build --workspace
@@ -46,11 +64,16 @@ Start the server:
 cargo run -p quantadb-server
 ```
 
-It listens on `127.0.0.1:54321` by default.
+It listens on `127.0.0.1:54321` for the native protocol and on
+`127.0.0.1:55432` for Postgres clients:
+
+```bash
+psql "host=127.0.0.1 port=55432 user=quanta dbname=quanta"
+```
 
 ## Protocol example
 
-Each protocol frame is one UTF-8 JSON object followed by a newline:
+Each native protocol frame is one UTF-8 JSON object followed by a newline:
 
 ```json
 {"protocol_version":1,"request_id":1,"request":{"type":"ping"}}

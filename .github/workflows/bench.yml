@@ -5,6 +5,7 @@ on:
     branches: ["main"]
   push:
     branches: ["main"]
+    paths-ignore: ["README.md"]
   workflow_dispatch:
 
 permissions:
@@ -214,3 +215,48 @@ jobs:
           else
             gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -F body=@comment.md >/dev/null
           fi
+
+  publish-readme:
+    needs: report
+    if: github.event_name == 'push'
+    name: Publish README numbers
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: result-*
+          path: results
+      - name: Fetch field reference
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow reference.yml \
+            --status success --limit 1 \
+            --json databaseId,updatedAt -q '.[0]' || true)
+          if [ -z "$run" ] || [ "$run" = "null" ]; then
+            exit 0
+          fi
+          run_id=$(echo "$run" | python -c "import json,sys; print(json.load(sys.stdin)['databaseId'])")
+          echo "$run" | python -c "import json,sys; print(json.load(sys.stdin)['updatedAt'][:10])" > reference-stamp.txt
+          gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'reference-*' --dir reference || true
+      - name: Rewrite the bench section
+        run: |
+          stamp=$(cat reference-stamp.txt 2>/dev/null || echo "never")
+          python .github/scripts/readme_bench.py results reference "$stamp" "$GITHUB_SHA"
+      - name: Commit if changed
+        run: |
+          if git diff --quiet README.md; then
+            echo "README already current"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "Refresh README bench numbers [skip ci]"
+          git push
