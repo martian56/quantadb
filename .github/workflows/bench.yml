@@ -3,68 +3,194 @@ name: Bench
 on:
   pull_request:
     branches: ["main"]
+  push:
+    branches: ["main"]
+  workflow_dispatch:
 
 permissions:
   contents: read
+  actions: read
   pull-requests: write
 
 concurrency:
-  group: bench-${{ github.event.pull_request.number }}
+  group: bench-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  bench:
-    name: Loadgen
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-latest
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+          - platform: windows-x64
+            runner: windows-latest
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - name: Build release
-        run: cargo build --release -p quantadb-server -p quantadb-bench
-      - name: Run workloads
+      - run: cargo build --release -p quantadb-server -p quantadb-bench
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.platform }}
+          path: |
+            target/release/quantadb-server*
+            target/release/loadgen*
+            !target/release/*.d
+            !target/release/*.pdb
+          if-no-files-found: error
+
+  bench:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: linux-x64-full
+            runner: ubuntu-latest
+            platform: linux-x64
+            mode: native
+          - profile: linux-x64-2cpu-2gb
+            runner: ubuntu-latest
+            platform: linux-x64
+            mode: docker
+            cpus: "2"
+            memory: 2g
+          - profile: linux-x64-1cpu-1gb
+            runner: ubuntu-latest
+            platform: linux-x64
+            mode: docker
+            cpus: "1"
+            memory: 1g
+          - profile: linux-arm64-full
+            runner: ubuntu-24.04-arm
+            platform: linux-arm64
+            mode: native
+          - profile: windows-x64-full
+            runner: windows-latest
+            platform: windows-x64
+            mode: native
+    name: Bench ${{ matrix.profile }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-${{ matrix.platform }}
+          path: bin
+      - name: Start server
+        shell: bash
         run: |
-          QUANTA_DATA_DIR="$RUNNER_TEMP/quantadb-bench" ./target/release/quantadb-server &
-          server_pid=$!
-          sleep 2
-          {
-            echo "reads"
-            ./target/release/loadgen --seconds 10 --connections 4 --rows 5000 --read-percent 100 | tail -3
-            echo "mixed 80/20"
-            ./target/release/loadgen --seconds 10 --connections 4 --rows 5000 --read-percent 80 | tail -3
-            echo "writes"
-            ./target/release/loadgen --seconds 10 --connections 4 --rows 5000 --read-percent 0 | tail -3
-          } > bench-output.txt
-          kill "$server_pid"
-          cat bench-output.txt
-      - name: Post results to the PR description
+          chmod +x bin/* 2>/dev/null || true
+          mkdir -p "$RUNNER_TEMP/qdata"
+          if [ "${{ matrix.mode }}" = "docker" ]; then
+            docker run -d --name qserver \
+              --cpus ${{ matrix.cpus }} --memory ${{ matrix.memory }} \
+              -p 54321:54321 \
+              -e QUANTA_DATA_DIR=/data \
+              -e QUANTA_LISTEN_ADDRESS=0.0.0.0:54321 \
+              -e QUANTA_PG_LISTEN_ADDRESS=off \
+              -e QUANTA_HTTP_LISTEN_ADDRESS=off \
+              -v "$RUNNER_TEMP/qdata:/data" \
+              -v "$PWD/bin:/app:ro" \
+              ubuntu:24.04 /app/quantadb-server
+          else
+            server=bin/quantadb-server
+            [ -f "$server" ] || server=bin/quantadb-server.exe
+            QUANTA_DATA_DIR="$RUNNER_TEMP/qdata" \
+            QUANTA_PG_LISTEN_ADDRESS=off \
+            QUANTA_HTTP_LISTEN_ADDRESS=off \
+            "$server" &
+          fi
+          for _ in $(seq 1 60); do
+            if (exec 3<>/dev/tcp/127.0.0.1/54321) 2>/dev/null; then
+              exec 3>&- || true
+              sleep 2
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "server never came up"
+          if [ "${{ matrix.mode }}" = "docker" ]; then docker logs qserver; fi
+          exit 1
+      - name: Run workloads
+        shell: bash
+        run: |
+          loadgen=bin/loadgen
+          [ -f "$loadgen" ] || loadgen=bin/loadgen.exe
+          run_pass() {
+            "$loadgen" --seconds 10 --connections 4 --rows 5000 --read-percent "$2" > pass.txt
+            cat pass.txt
+            python .github/scripts/parse_loadgen.py "$1" pass.txt >> "${{ matrix.profile }}.jsonl"
+          }
+          run_pass reads 100
+          run_pass mixed 80
+          run_pass writes 0
+      - name: Server diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          if [ "${{ matrix.mode }}" = "docker" ]; then
+            docker ps -a
+            docker logs qserver || true
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ matrix.profile }}
+          path: ${{ matrix.profile }}.jsonl
+          if-no-files-found: error
+
+  report:
+    needs: bench
+    name: Report
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: result-*
+          path: results
+      - name: Fetch baseline from main
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow bench.yml \
+            --branch main --status success --limit 1 \
+            --json databaseId,headSha -q '.[0]' || true)
+          if [ -z "$run" ] || [ "$run" = "null" ]; then
+            echo "no baseline run on main yet"
+            exit 0
+          fi
+          run_id=$(echo "$run" | python -c "import json,sys; print(json.load(sys.stdin)['databaseId'])")
+          echo "$run" | python -c "import json,sys; print(json.load(sys.stdin)['headSha'])" > baseline-sha.txt
+          gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'result-*' --dir baseline || echo "baseline artifacts expired"
+      - name: Build report
+        shell: bash
+        run: |
+          sha=$(cat baseline-sha.txt 2>/dev/null || echo "")
+          python .github/scripts/bench_report.py results baseline comment.md "$sha"
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Post sticky comment
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
         run: |
-          gh pr view "$PR" --json body -q .body > pr-body.md
-          python3 - <<'EOF'
-          begin = "<!-- bench-results -->"
-          end = "<!-- /bench-results -->"
-          with open("pr-body.md", encoding="utf-8") as handle:
-              body = handle.read()
-          with open("bench-output.txt", encoding="utf-8") as handle:
-              bench = handle.read().rstrip()
-          section = (
-              f"{begin}\n## Bench\n\n"
-              "Loadgen on this PR's build, one shared CI runner, "
-              "so treat these as directional, not absolute.\n\n"
-              f"```\n{bench}\n```\n{end}"
-          )
-          if begin in body and end in body:
-              head, rest = body.split(begin, 1)
-              _, tail = rest.split(end, 1)
-              body = head + section + tail
-          else:
-              body = body.rstrip() + "\n\n" + section + "\n"
-          with open("pr-body.md", "w", encoding="utf-8") as handle:
-              handle.write(body)
-          EOF
-          gh pr edit "$PR" --body-file pr-body.md
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+            -q '.[] | select(.body | startswith("<!-- quantadb-bench-report -->")) | .id' | head -1)
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" -F body=@comment.md >/dev/null
+          else
+            gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -F body=@comment.md >/dev/null
+          fi
