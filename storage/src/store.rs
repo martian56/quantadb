@@ -355,6 +355,59 @@ impl DurableStore {
         })
     }
 
+    /// A data-file handle for the paced flusher's writes.
+    ///
+    /// Only the commit worker writes through this, and only when no
+    /// background checkpoint is in flight, so it never races the
+    /// checkpointer's handle onto the same page.
+    pub fn shared_data_writer(&self) -> Result<File> {
+        self.data.share()
+    }
+
+    /// Claim up to `budget` queued pages for writing outside the lock.
+    ///
+    /// The caller owns every page this returns and must report back through
+    /// `note_flushed`, otherwise the page leaves the queue without reaching
+    /// the data file and a checkpoint would drop its log protection.
+    pub fn take_flush_batch(&mut self, budget: usize) -> Result<Vec<Page>> {
+        if self.checkpoint_in_flight {
+            return Ok(Vec::new());
+        }
+        let dirty = self
+            .dirty
+            .pages
+            .read()
+            .map_err(|_| StorageError::Poisoned)?;
+        let mut claimed = Vec::new();
+        while claimed.len() < budget {
+            let Some(page_id) = self.flush_queue.pop_front() else {
+                break;
+            };
+            let Some(page) = dirty.get(&page_id) else {
+                continue;
+            };
+            if self
+                .flushed
+                .get(&page_id)
+                .is_some_and(|written| *written == page.lsn())
+            {
+                continue;
+            }
+            claimed.push(page.clone());
+        }
+        Ok(claimed)
+    }
+
+    /// Record what the caller wrote and requeue what it did not.
+    pub fn note_flushed(&mut self, written: &[(PageId, Lsn)], unwritten: &[PageId]) {
+        for (page_id, lsn) in written {
+            self.flushed.insert(*page_id, *lsn);
+        }
+        for page_id in unwritten.iter().rev() {
+            self.flush_queue.push_front(*page_id);
+        }
+    }
+
     pub fn page_count(&self) -> Result<u64> {
         let dirty_end = self
             .dirty
@@ -743,6 +796,38 @@ mod tests {
     use crate::{page::PAGE_SIZE, Page};
     use std::io::Write;
     use tempfile::tempdir;
+
+    #[test]
+    fn a_claimed_page_that_was_not_written_survives_the_next_checkpoint() {
+        let directory = tempdir().expect("tempdir");
+        let mut store =
+            DurableStore::open(directory.path(), StoreOptions::default()).expect("open store");
+        store
+            .write_page(PageId(1), b"kept".to_vec())
+            .expect("write");
+
+        // Claim the page as the pacer would, then report writing nothing.
+        let claimed = store.take_flush_batch(16).expect("claim");
+        assert_eq!(claimed.len(), 1);
+        let unwritten: Vec<PageId> = claimed.iter().map(Page::id).collect();
+        store.note_flushed(&[], &unwritten);
+
+        // The checkpoint must still find it, or the log reset it performs
+        // would drop the only durable copy.
+        store.checkpoint().expect("checkpoint");
+        drop(store);
+
+        let mut reopened =
+            DurableStore::open(directory.path(), StoreOptions::default()).expect("reopen");
+        assert_eq!(
+            reopened
+                .read_page(PageId(1))
+                .expect("read")
+                .expect("page survived")
+                .payload(),
+            b"kept"
+        );
+    }
 
     #[test]
     fn background_checkpoint_flushes_and_recycles_off_the_lock() {

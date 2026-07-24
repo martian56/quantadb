@@ -3,6 +3,7 @@ use crate::{
     DurableStore, Lsn, Page, PageId, PageWrite, Result, StorageError, MAX_PAGE_PAYLOAD,
 };
 use std::{
+    fs::File,
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
@@ -122,6 +123,7 @@ impl GroupCommitter {
         let options = options.validate()?;
         let reader = Arc::new(store.shared_reader()?);
         let allocator = store.page_allocator();
+        let data_writer = store.shared_data_writer()?;
         let store = Arc::new(Mutex::new(store));
         let stats = Arc::new(AtomicStats::default());
         let (sender, receiver) = mpsc::sync_channel(options.queue_depth);
@@ -144,6 +146,7 @@ impl GroupCommitter {
                     worker_stats,
                     options,
                     checkpoint_sender,
+                    data_writer,
                 );
             })?;
 
@@ -289,6 +292,7 @@ fn commit_worker(
     stats: Arc<AtomicStats>,
     options: GroupCommitOptions,
     checkpoint_sender: SyncSender<BackgroundCheckpoint>,
+    data_writer: File,
 ) {
     let mut pending = None;
     loop {
@@ -324,7 +328,7 @@ fn commit_worker(
                     }
                 }
                 execute_group(&store, &stats, requests);
-                pace_flush(&store, &options);
+                pace_flush(&store, &data_writer, &options);
                 maybe_checkpoint(&store, &stats, &options, &checkpoint_sender);
             }
             Command::Checkpoint(response) => {
@@ -338,12 +342,40 @@ fn commit_worker(
     }
 }
 
-fn pace_flush(store: &Mutex<DurableStore>, options: &GroupCommitOptions) {
+/// Write a slice of dirty pages with the store lock released.
+///
+/// Commits hold that lock across their log sync, so doing page writes under
+/// it put every flushed page on the commit path. Claiming the batch, writing
+/// it through a separate handle, then reporting back keeps the lock held
+/// only for the two short bookkeeping steps.
+fn pace_flush(store: &Mutex<DurableStore>, data: &File, options: &GroupCommitOptions) {
     if options.flush_pages_per_batch == 0 {
         return;
     }
+    let claimed = match store.lock() {
+        Ok(mut store) => match store.take_flush_batch(options.flush_pages_per_batch) {
+            Ok(claimed) => claimed,
+            Err(_) => return,
+        },
+        Err(_) => return,
+    };
+    if claimed.is_empty() {
+        return;
+    }
+
+    let mut written = Vec::with_capacity(claimed.len());
+    let mut unwritten = Vec::new();
+    for (index, page) in claimed.iter().enumerate() {
+        if crate::data_file::write_shared(data, page).is_ok() {
+            written.push((page.id(), page.lsn()));
+        } else {
+            unwritten.extend(claimed[index..].iter().map(Page::id));
+            break;
+        }
+    }
+
     if let Ok(mut store) = store.lock() {
-        let _ = store.flush_some_dirty(options.flush_pages_per_batch);
+        store.note_flushed(&written, &unwritten);
     }
 }
 
