@@ -37,7 +37,30 @@ on the same runners with one shared driver. The tables below are rewritten
 by CI from the newest run on main, so they are current, not curated.
 
 <!-- bench:start -->
-Numbers appear here after the next merge to main.
+Measured on main at `86c2a0134`.
+
+QuantaDB on GitHub runners, loadgen native protocol, 10 seconds per
+workload at 4 connections:
+
+| profile | reads ops/s | mixed ops/s | writes ops/s | write p99 ms |
+|---|---:|---:|---:|---:|
+| linux-arm64-full | 32711 | 13134 | 3413 | 18.8 |
+| linux-x64-1cpu-1gb | 13419 | 7292 | 2410 | 12.8 |
+| linux-x64-2cpu-2gb | 16213 | 10880 | 4810 | 2.9 |
+| linux-x64-full | 30236 | 15169 | 5344 | 2.9 |
+| windows-x64-full | 28309 | 7448 | 633 | 16.0 |
+
+The field at 2 CPUs and 2 GiB, identical containers, one shared
+driver through each engine's Postgres or MySQL port, measured 2026-07-24:
+
+| engine | reads ops/s | mixed ops/s | writes ops/s |
+|---|---:|---:|---:|
+| **quantadb** | 32215 | 13871 | 3036 |
+| postgres18 | 33941 | 23876 | 10318 |
+| mariadb114 | 6070 | 5428 | 4957 |
+| mysql84 | 6279 | 5030 | 3738 |
+
+MySQL and MariaDB read throughput is limited by the pure Python client in the shared driver; their write numbers are server bound.
 <!-- bench:end -->
 
 Read latencies are the headline: QuantaDB serves reads without touching the
