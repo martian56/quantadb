@@ -29,6 +29,17 @@ pub struct PageWrite {
     pub payload: Vec<u8>,
 }
 
+/// Bytes destined for a known offset inside a page.
+///
+/// The offset is the caller's, not the store's, so two writers filling the
+/// same page can hand their records to the log in any order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageAppend {
+    pub page_id: PageId,
+    pub offset: u32,
+    pub payload: Vec<u8>,
+}
+
 impl Default for StoreOptions {
     fn default() -> Self {
         Self {
@@ -416,7 +427,7 @@ impl DurableStore {
         result
     }
 
-    /// Add bytes to the end of pages instead of replacing them.
+    /// Place bytes inside pages instead of replacing them.
     ///
     /// Each append logs only its own bytes, so filling one page with many
     /// small records costs the log the size of the records, not the size of
@@ -424,9 +435,9 @@ impl DurableStore {
     /// is touched if any page would outgrow its payload limit.
     pub fn append_pages(
         &mut self,
-        appends: impl IntoIterator<Item = PageWrite>,
+        appends: impl IntoIterator<Item = PageAppend>,
     ) -> Result<Vec<Lsn>> {
-        let appends: Vec<PageWrite> = appends.into_iter().collect();
+        let appends: Vec<PageAppend> = appends.into_iter().collect();
         if appends.is_empty() {
             return Ok(Vec::new());
         }
@@ -440,7 +451,7 @@ impl DurableStore {
         result
     }
 
-    fn append_pages_inner(&mut self, appends: &[PageWrite], durable: bool) -> Result<Vec<Lsn>> {
+    fn append_pages_inner(&mut self, appends: &[PageAppend], durable: bool) -> Result<Vec<Lsn>> {
         // Build each target's resulting image first so an oversized batch
         // fails before a single record reaches the log.
         let mut grown: std::collections::HashMap<PageId, Vec<u8>> =
@@ -468,24 +479,27 @@ impl DurableStore {
                 slot.insert(base);
             }
             let target = grown.get_mut(&append.page_id).expect("inserted above");
-            let combined = target.len().checked_add(append.payload.len()).ok_or(
-                StorageError::PageTooLarge {
+            let end = (append.offset as usize)
+                .checked_add(append.payload.len())
+                .ok_or(StorageError::PageTooLarge {
                     actual: usize::MAX,
                     maximum: crate::MAX_PAGE_PAYLOAD,
-                },
-            )?;
-            if combined > crate::MAX_PAGE_PAYLOAD {
+                })?;
+            if end > crate::MAX_PAGE_PAYLOAD {
                 return Err(StorageError::PageTooLarge {
-                    actual: combined,
+                    actual: end,
                     maximum: crate::MAX_PAGE_PAYLOAD,
                 });
             }
-            target.extend_from_slice(&append.payload);
+            splice(target, append.offset as usize, &append.payload);
         }
 
         let mut lsns = Vec::with_capacity(appends.len());
         for append in appends {
-            lsns.push(self.wal.append_page_tail(append.page_id, &append.payload)?);
+            lsns.push(
+                self.wal
+                    .append_page_tail(append.page_id, append.offset, &append.payload)?,
+            );
         }
         self.wal.append_batch_commit(appends.len())?;
         if durable {
@@ -714,9 +728,9 @@ impl DurableStore {
             if current.as_ref().is_some_and(|page| page.lsn() >= write.lsn) {
                 continue;
             }
-            let payload = if write.append {
+            let payload = if let Some(offset) = write.append_at {
                 let mut base = current.map_or_else(Vec::new, |page| page.payload().to_vec());
-                base.extend_from_slice(&write.payload);
+                splice(&mut base, offset as usize, &write.payload);
                 base
             } else {
                 write.payload
@@ -742,13 +756,22 @@ impl DurableStore {
     }
 }
 
+/// Place bytes at an offset, zero filling any gap before them.
+fn splice(base: &mut Vec<u8>, offset: usize, bytes: &[u8]) {
+    let end = offset + bytes.len();
+    if base.len() < end {
+        base.resize(end, 0);
+    }
+    base[offset..end].copy_from_slice(bytes);
+}
+
 /// One page change that a batch commit made durable.
 struct CommittedWrite {
     lsn: Lsn,
     page_id: PageId,
     payload: Vec<u8>,
-    /// Add the payload to the page rather than replace the page with it.
-    append: bool,
+    /// Where in the page the payload belongs, when this is an append.
+    append_at: Option<u32>,
 }
 
 fn committed_page_images(records: &[crate::wal::WalRecord]) -> Result<Vec<CommittedWrite>> {
@@ -766,15 +789,19 @@ fn committed_page_images(records: &[crate::wal::WalRecord]) -> Result<Vec<Commit
                     lsn: record.lsn,
                     page_id: *page_id,
                     payload: payload.clone(),
-                    append: false,
+                    append_at: None,
                 });
             }
-            WalKind::PageAppend { page_id, payload } => {
+            WalKind::PageAppend {
+                page_id,
+                offset,
+                payload,
+            } => {
                 pending.push(CommittedWrite {
                     lsn: record.lsn,
                     page_id: *page_id,
                     payload: payload.clone(),
-                    append: true,
+                    append_at: Some(*offset),
                 });
             }
             WalKind::BatchCommit { page_count } => {
@@ -878,13 +905,16 @@ mod tests {
         {
             let mut store =
                 DurableStore::open(directory.path(), StoreOptions::default()).expect("open");
+            let mut at = 0_u32;
             for chunk in [b"one/".as_slice(), b"two/", b"three/"] {
                 store
-                    .append_pages([PageWrite {
+                    .append_pages([PageAppend {
                         page_id: PageId(3),
+                        offset: at,
                         payload: chunk.to_vec(),
                     }])
                     .expect("append");
+                at += chunk.len() as u32;
             }
             assert_eq!(
                 store
@@ -910,14 +940,51 @@ mod tests {
     }
 
     #[test]
+    fn appends_that_reach_the_log_out_of_order_still_land_correctly() {
+        let directory = tempdir().expect("tempdir");
+        {
+            let mut store =
+                DurableStore::open(directory.path(), StoreOptions::default()).expect("open");
+            // Two writers filling one page: the later offset commits first.
+            store
+                .append_pages([PageAppend {
+                    page_id: PageId(5),
+                    offset: 4,
+                    payload: b"second".to_vec(),
+                }])
+                .expect("append tail first");
+            store
+                .append_pages([PageAppend {
+                    page_id: PageId(5),
+                    offset: 0,
+                    payload: b"1st/".to_vec(),
+                }])
+                .expect("append head second");
+        }
+
+        let mut reopened =
+            DurableStore::open(directory.path(), StoreOptions::default()).expect("reopen");
+        assert_eq!(
+            reopened
+                .read_page(PageId(5))
+                .expect("read")
+                .expect("page")
+                .payload(),
+            b"1st/second",
+            "each record replays at its own offset regardless of log order"
+        );
+    }
+
+    #[test]
     fn appends_after_a_checkpoint_extend_what_the_data_file_holds() {
         let directory = tempdir().expect("tempdir");
         {
             let mut store =
                 DurableStore::open(directory.path(), StoreOptions::default()).expect("open");
             store
-                .append_pages([PageWrite {
+                .append_pages([PageAppend {
                     page_id: PageId(1),
+                    offset: 0,
                     payload: b"before/".to_vec(),
                 }])
                 .expect("append");
@@ -925,8 +992,9 @@ mod tests {
             // log, so the next append has to read the base back off disk.
             store.checkpoint().expect("checkpoint");
             store
-                .append_pages([PageWrite {
+                .append_pages([PageAppend {
                     page_id: PageId(1),
+                    offset: b"before/".len() as u32,
                     payload: b"after".to_vec(),
                 }])
                 .expect("append after checkpoint");
@@ -951,16 +1019,19 @@ mod tests {
             DurableStore::open(directory.path(), StoreOptions::default()).expect("open");
         store
             .append_pages([
-                PageWrite {
+                PageAppend {
                     page_id: PageId(2),
+                    offset: 0,
                     payload: b"a".to_vec(),
                 },
-                PageWrite {
+                PageAppend {
                     page_id: PageId(7),
+                    offset: 0,
                     payload: b"x".to_vec(),
                 },
-                PageWrite {
+                PageAppend {
                     page_id: PageId(2),
+                    offset: 1,
                     payload: b"b".to_vec(),
                 },
             ])
@@ -989,16 +1060,18 @@ mod tests {
         let mut store =
             DurableStore::open(directory.path(), StoreOptions::default()).expect("open");
         store
-            .append_pages([PageWrite {
+            .append_pages([PageAppend {
                 page_id: PageId(1),
+                offset: 0,
                 payload: vec![b'k'; 64],
             }])
             .expect("first append");
         let log_before = store.wal_size_bytes().expect("size");
 
         assert!(matches!(
-            store.append_pages([PageWrite {
+            store.append_pages([PageAppend {
                 page_id: PageId(1),
+                offset: 64,
                 payload: vec![b'z'; crate::MAX_PAGE_PAYLOAD],
             }]),
             Err(StorageError::PageTooLarge { .. })
