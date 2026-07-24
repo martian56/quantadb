@@ -1,6 +1,7 @@
 """Build the bench comparison comment from result and baseline records.
 
-Usage: bench_report.py <results_dir> <baseline_dir> <output_md> [baseline_sha]
+Usage: bench_report.py <results_dir> <baseline_dir> <output_md>
+           [baseline_sha] [reference_dir] [reference_stamp]
 """
 
 import json
@@ -119,9 +120,72 @@ def overall_verdict(profiles, baselines):
     return "✅ All profiles within the ±10% noise band of main."
 
 
+FIELD_ENGINES = ["quantadb", "postgres18", "mariadb114", "mysql84"]
+
+
+def load_field(directory):
+    profiles = {}
+    root = pathlib.Path(directory)
+    if not root.is_dir():
+        return profiles
+    for path in sorted(root.rglob("*.jsonl")):
+        records = {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                record = json.loads(line)
+                records[(record["engine"], record["workload"])] = record
+        if records:
+            profiles[path.stem] = records
+    return profiles
+
+
+def field_cell(records, engine, workload):
+    record = records.get((engine, workload))
+    if record is None:
+        return "-"
+    wp99 = record.get("write_p99_ms")
+    if workload == "reads" or wp99 is None:
+        return str(record["ops_per_s"])
+    return f"{record['ops_per_s']} ({wp99:.0f}ms wp99)"
+
+
+def field_section(field_profiles, stamp):
+    if not field_profiles:
+        return []
+    lines = [
+        "## Field reference",
+        "",
+        f"All engines in identical containers, same driver, measured {stamp}. "
+        "A different harness than the tables above, so read this as standing, "
+        "not as this PR's delta.",
+        "",
+    ]
+    for name, records in field_profiles.items():
+        lines.append(f"### {name}")
+        lines.append("")
+        lines.append("| engine | reads | mixed | writes |")
+        lines.append("|---|---|---|---|")
+        for engine in FIELD_ENGINES:
+            if not any(key[0] == engine for key in records):
+                continue
+            label = f"**{engine}**" if engine == "quantadb" else engine
+            lines.append(
+                "| {} | {} | {} | {} |".format(
+                    label,
+                    field_cell(records, engine, "reads"),
+                    field_cell(records, engine, "mixed"),
+                    field_cell(records, engine, "writes"),
+                )
+            )
+        lines.append("")
+    return lines
+
+
 def main():
     results_dir, baseline_dir, output = sys.argv[1], sys.argv[2], sys.argv[3]
     baseline_sha = sys.argv[4] if len(sys.argv) > 4 else ""
+    reference_dir = sys.argv[5] if len(sys.argv) > 5 else ""
+    reference_stamp = sys.argv[6] if len(sys.argv) > 6 else "at an unknown time"
     profiles = load(results_dir)
     baselines = load(baseline_dir)
 
@@ -139,6 +203,8 @@ def main():
     lines.append("")
     for name, records in profiles.items():
         lines.extend(profile_section(name, records, baselines.get(name, {})))
+    if reference_dir:
+        lines.extend(field_section(load_field(reference_dir), reference_stamp))
     lines.append(
         "_Shared CI runners: treat single-profile swings as suggestive, "
         "agreement across profiles as real._"
