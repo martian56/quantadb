@@ -12,6 +12,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// How long a forming batch waits with nothing arriving before it closes.
+///
+/// The batch deadline still caps the total wait; this only stops a group
+/// that has already collected every waiting writer from idling until the
+/// deadline expires.
+const QUIET_WINDOW: Duration = Duration::from_micros(20);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GroupCommitOptions {
     pub queue_depth: usize,
@@ -332,7 +339,14 @@ fn commit_worker(
                 let deadline = Instant::now() + options.max_delay;
 
                 while page_count < options.max_batch_pages {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    // Stop as soon as the queue goes quiet rather than
+                    // sitting out the whole window. Clients arrive in a
+                    // burst once the previous group answers them, so the
+                    // window was mostly spent waiting for writers that had
+                    // already been collected.
+                    let remaining = deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(QUIET_WINDOW);
                     if remaining.is_zero() {
                         break;
                     }
