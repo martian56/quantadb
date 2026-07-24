@@ -1,5 +1,5 @@
 use crate::{
-    store::{PageAllocator, SharedReader},
+    store::{BackgroundCheckpoint, PageAllocator, SharedReader},
     DurableStore, Lsn, Page, PageId, PageWrite, Result, StorageError, MAX_PAGE_PAYLOAD,
 };
 use std::{
@@ -106,6 +106,7 @@ enum Command {
 pub struct GroupCommitter {
     handle: GroupCommitHandle,
     worker: Option<JoinHandle<()>>,
+    checkpointer: Option<JoinHandle<()>>,
 }
 
 #[derive(Clone)]
@@ -124,11 +125,27 @@ impl GroupCommitter {
         let store = Arc::new(Mutex::new(store));
         let stats = Arc::new(AtomicStats::default());
         let (sender, receiver) = mpsc::sync_channel(options.queue_depth);
+        let (checkpoint_sender, checkpoint_receiver) = mpsc::sync_channel(1);
+        let checkpointer_store = Arc::clone(&store);
+        let checkpointer_stats = Arc::clone(&stats);
+        let checkpointer = thread::Builder::new()
+            .name("quantadb-checkpoint".to_owned())
+            .spawn(move || {
+                checkpoint_worker(checkpoint_receiver, checkpointer_store, checkpointer_stats);
+            })?;
         let worker_store = store;
         let worker_stats = Arc::clone(&stats);
         let worker = thread::Builder::new()
             .name("quantadb-group-commit".to_owned())
-            .spawn(move || commit_worker(receiver, worker_store, worker_stats, options))?;
+            .spawn(move || {
+                commit_worker(
+                    receiver,
+                    worker_store,
+                    worker_stats,
+                    options,
+                    checkpoint_sender,
+                );
+            })?;
 
         Ok(Self {
             handle: GroupCommitHandle {
@@ -138,6 +155,7 @@ impl GroupCommitter {
                 stats,
             },
             worker: Some(worker),
+            checkpointer: Some(checkpointer),
         })
     }
 
@@ -165,6 +183,12 @@ impl GroupCommitter {
         worker
             .join()
             .map_err(|_| StorageError::GroupCommit("worker thread panicked".to_owned()))?;
+        // the worker's exit drops the only checkpoint sender
+        if let Some(checkpointer) = self.checkpointer.take() {
+            checkpointer
+                .join()
+                .map_err(|_| StorageError::GroupCommit("checkpoint thread panicked".to_owned()))?;
+        }
         Ok(())
     }
 }
@@ -264,6 +288,7 @@ fn commit_worker(
     store: Arc<Mutex<DurableStore>>,
     stats: Arc<AtomicStats>,
     options: GroupCommitOptions,
+    checkpoint_sender: SyncSender<BackgroundCheckpoint>,
 ) {
     let mut pending = None;
     loop {
@@ -300,14 +325,10 @@ fn commit_worker(
                 }
                 execute_group(&store, &stats, requests);
                 pace_flush(&store, &options);
-                maybe_checkpoint(&store, &stats, &options);
+                maybe_checkpoint(&store, &stats, &options, &checkpoint_sender);
             }
             Command::Checkpoint(response) => {
-                let result = store
-                    .lock()
-                    .map_err(|_| StorageError::GroupCommit("store mutex is poisoned".to_owned()))
-                    .and_then(|mut store| store.checkpoint());
-                let _ = response.send(result);
+                let _ = response.send(explicit_checkpoint(&store));
             }
             Command::Shutdown(response) => {
                 let _ = response.send(());
@@ -317,13 +338,6 @@ fn commit_worker(
     }
 }
 
-/// Truncate the log once it outgrows the configured budget.
-///
-/// Runs on the worker thread between batches, so no commit ever waits on a
-/// checkpoint that its own batch triggered. A failed checkpoint poisons the
-/// store, which makes the next commit fail loudly instead of silently
-/// running with an unbounded log.
-/// Write a slice of dirty pages into the page cache between batches.
 fn pace_flush(store: &Mutex<DurableStore>, options: &GroupCommitOptions) {
     if options.flush_pages_per_batch == 0 {
         return;
@@ -334,21 +348,75 @@ fn pace_flush(store: &Mutex<DurableStore>, options: &GroupCommitOptions) {
 }
 
 fn maybe_checkpoint(
-    store: &Mutex<DurableStore>,
+    store: &Arc<Mutex<DurableStore>>,
     stats: &AtomicStats,
     options: &GroupCommitOptions,
+    checkpoint_sender: &SyncSender<BackgroundCheckpoint>,
 ) {
     if options.checkpoint_after_wal_bytes == 0 {
         return;
     }
-    let Ok(mut store) = store.lock() else {
+    let Ok(mut locked) = store.lock() else {
         return;
     };
-    let oversized = store
+    let oversized = locked
         .wal_size_bytes()
         .is_ok_and(|size| size >= options.checkpoint_after_wal_bytes);
-    if oversized && store.checkpoint().is_ok() {
+    if !oversized || locked.checkpoint_in_flight() {
+        return;
+    }
+    if locked.can_begin_background_checkpoint() {
+        let Ok(job) = locked.begin_background_checkpoint() else {
+            return;
+        };
+        drop(locked);
+        if checkpoint_sender.try_send(job).is_err() {
+            // checkpointer is gone; leave repair to a classic checkpoint
+            if let Ok(mut locked) = store.lock() {
+                locked.abort_background_checkpoint();
+            }
+        }
+    } else if locked.checkpoint().is_ok() {
+        // a failed background run left the spare unrecycled
         stats.automatic_checkpoints.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn checkpoint_worker(
+    receiver: Receiver<BackgroundCheckpoint>,
+    store: Arc<Mutex<DurableStore>>,
+    stats: Arc<AtomicStats>,
+) {
+    while let Ok(job) = receiver.recv() {
+        let result = job.run();
+        let Ok(mut locked) = store.lock() else {
+            return;
+        };
+        match result {
+            Ok(written) => {
+                if locked
+                    .complete_background_checkpoint(&job, &written)
+                    .is_ok()
+                {
+                    stats.automatic_checkpoints.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Err(_) => locked.abort_background_checkpoint(),
+        }
+    }
+}
+
+fn explicit_checkpoint(store: &Mutex<DurableStore>) -> Result<Lsn> {
+    loop {
+        {
+            let mut locked = store
+                .lock()
+                .map_err(|_| StorageError::GroupCommit("store mutex is poisoned".to_owned()))?;
+            if !locked.checkpoint_in_flight() {
+                return locked.checkpoint();
+            }
+        }
+        thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -431,11 +499,6 @@ mod tests {
                 .expect("commit");
         }
 
-        let stats = handle.stats();
-        assert!(
-            stats.automatic_checkpoints > 0,
-            "the worker must have checkpointed at least once: {stats:?}"
-        );
         for page_id in 0..8_u64 {
             let page = handle
                 .read_page(PageId(page_id))
@@ -443,7 +506,73 @@ mod tests {
                 .expect("page");
             assert_eq!(page.payload()[0], 0x2b);
         }
+        // background checkpoints report asynchronously, so settle first
         coordinator.shutdown().expect("shutdown");
+        let stats = handle.stats();
+        assert!(
+            stats.automatic_checkpoints > 0,
+            "at least one checkpoint must have run: {stats:?}"
+        );
+    }
+
+    #[test]
+    fn commits_keep_landing_while_background_checkpoints_run() {
+        let directory = tempdir().expect("tempdir");
+        let store =
+            DurableStore::open(directory.path(), StoreOptions::default()).expect("open store");
+        let coordinator = GroupCommitter::start(
+            store,
+            GroupCommitOptions {
+                checkpoint_after_wal_bytes: 8192,
+                ..GroupCommitOptions::default()
+            },
+        )
+        .expect("coordinator");
+        let barrier = Arc::new(Barrier::new(4));
+        let mut threads = Vec::new();
+
+        for writer in 0..4_u64 {
+            let handle = coordinator.handle();
+            let barrier = Arc::clone(&barrier);
+            threads.push(thread::spawn(move || {
+                barrier.wait();
+                for round in 0..64_u64 {
+                    let page_id = PageId(writer * 64 + round);
+                    handle
+                        .commit(vec![PageWrite {
+                            page_id,
+                            payload: vec![writer as u8 + 1; 1024],
+                        }])
+                        .expect("commit under checkpoints");
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().expect("writer thread");
+        }
+
+        let handle = coordinator.handle();
+        let explicit = handle.checkpoint().expect("explicit checkpoint");
+        assert!(explicit.0 > 0);
+        coordinator.shutdown().expect("shutdown");
+
+        let stats = handle.stats();
+        assert!(
+            stats.automatic_checkpoints > 0,
+            "the tiny threshold must have fired: {stats:?}"
+        );
+        let reopened =
+            DurableStore::open(directory.path(), StoreOptions::default()).expect("reopen");
+        let reader = reopened.shared_reader().expect("reader");
+        for writer in 0..4_u64 {
+            for round in 0..64_u64 {
+                let page = reader
+                    .read_page(PageId(writer * 64 + round))
+                    .expect("read")
+                    .expect("page survived");
+                assert_eq!(page.payload()[0], writer as u8 + 1);
+            }
+        }
     }
 
     #[test]

@@ -68,6 +68,16 @@ impl DataFile {
     }
 }
 
+/// Callers must ensure no concurrent writer targets the same page.
+pub(crate) fn write_shared(file: &File, page: &Page) -> Result<()> {
+    write_all_at(file, &page.encode(), page_offset(page.id())?)
+}
+
+pub(crate) fn sync_shared(file: &File) -> Result<()> {
+    file.sync_data()?;
+    Ok(())
+}
+
 /// Read one page at its offset without using the shared cursor.
 pub(crate) fn read_shared(file: &File, page_id: PageId) -> Result<Option<Page>> {
     let offset = page_offset(page_id)?;
