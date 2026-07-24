@@ -1,0 +1,70 @@
+name: Bench
+
+on:
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: bench-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: Loadgen
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release
+        run: cargo build --release -p quantadb-server -p quantadb-bench
+      - name: Run workloads
+        run: |
+          QUANTA_DATA_DIR="$RUNNER_TEMP/quantadb-bench" ./target/release/quantadb-server &
+          server_pid=$!
+          sleep 2
+          {
+            echo "reads"
+            ./target/release/loadgen --seconds 10 --connections 4 --rows 5000 --read-percent 100 | tail -3
+            echo "mixed 80/20"
+            ./target/release/loadgen --seconds 10 --connections 4 --rows 5000 --read-percent 80 | tail -3
+            echo "writes"
+            ./target/release/loadgen --seconds 10 --connections 4 --rows 5000 --read-percent 0 | tail -3
+          } > bench-output.txt
+          kill "$server_pid"
+          cat bench-output.txt
+      - name: Post results to the PR description
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          gh pr view "$PR" --json body -q .body > pr-body.md
+          python3 - <<'EOF'
+          begin = "<!-- bench-results -->"
+          end = "<!-- /bench-results -->"
+          with open("pr-body.md", encoding="utf-8") as handle:
+              body = handle.read()
+          with open("bench-output.txt", encoding="utf-8") as handle:
+              bench = handle.read().rstrip()
+          section = (
+              f"{begin}\n## Bench\n\n"
+              "Loadgen on this PR's build, one shared CI runner, "
+              "so treat these as directional, not absolute.\n\n"
+              f"```\n{bench}\n```\n{end}"
+          )
+          if begin in body and end in body:
+              head, rest = body.split(begin, 1)
+              _, tail = rest.split(end, 1)
+              body = head + section + tail
+          else:
+              body = body.rstrip() + "\n\n" + section + "\n"
+          with open("pr-body.md", "w", encoding="utf-8") as handle:
+              handle.write(body)
+          EOF
+          gh pr edit "$PR" --body-file pr-body.md
