@@ -113,6 +113,7 @@ jobs:
           for _ in $(seq 1 60); do
             if (exec 3<>/dev/tcp/127.0.0.1/54321) 2>/dev/null; then
               exec 3>&- || true
+              sleep 2
               exit 0
             fi
             sleep 1
@@ -133,6 +134,14 @@ jobs:
           run_pass reads 100
           run_pass mixed 80
           run_pass writes 0
+      - name: Server diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          if [ "${{ matrix.mode }}" = "docker" ]; then
+            docker ps -a
+            docker logs qserver || true
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: result-${{ matrix.profile }}
