@@ -152,7 +152,12 @@ impl BackgroundCheckpoint {
     /// Holds no store lock; pages re-dirtied since the rotation are skipped.
     pub fn run(&self) -> Result<Vec<(PageId, Lsn)>> {
         const CHUNK: usize = 64;
+        // Sync in bounded slices: a device flush pays for everything queued
+        // behind it, so capping the unsynced backlog keeps each flush short
+        // and commit fsyncs interleave instead of waiting out one big one.
+        const SYNC_SLICE_PAGES: usize = 512;
         let mut written = Vec::with_capacity(self.manifest.len());
+        let mut unsynced = 0_usize;
         for manifest_chunk in self.manifest.chunks(CHUNK) {
             let pages: Vec<Page> = {
                 let dirty = self
@@ -173,6 +178,11 @@ impl BackgroundCheckpoint {
             for page in &pages {
                 crate::data_file::write_shared(&self.data_file, page)?;
                 written.push((page.id(), page.lsn()));
+            }
+            unsynced += pages.len();
+            if unsynced >= SYNC_SLICE_PAGES {
+                crate::data_file::sync_shared(&self.data_file)?;
+                unsynced = 0;
             }
         }
         crate::data_file::sync_shared(&self.data_file)?;
@@ -801,6 +811,42 @@ mod tests {
             b"two again",
             "the post-rotation batch replays from the new active segment"
         );
+    }
+
+    #[test]
+    fn a_checkpoint_spanning_several_sync_slices_keeps_every_page() {
+        let directory = tempdir().expect("tempdir");
+        let mut store =
+            DurableStore::open(directory.path(), StoreOptions::default()).expect("open store");
+        // More than one sync slice so the intermediate syncs run.
+        let count = 1_300_u64;
+        for page_id in 0..count {
+            store
+                .write_page(PageId(page_id), page_id.to_le_bytes().to_vec())
+                .expect("write");
+        }
+
+        let job = store.begin_background_checkpoint().expect("begin");
+        let written = job.run().expect("run");
+        assert_eq!(written.len(), count as usize);
+        store
+            .complete_background_checkpoint(&job, &written)
+            .expect("complete");
+
+        drop(store);
+        let mut reopened =
+            DurableStore::open(directory.path(), StoreOptions::default()).expect("reopen");
+        for page_id in 0..count {
+            assert_eq!(
+                reopened
+                    .read_page(PageId(page_id))
+                    .expect("read")
+                    .expect("page survived")
+                    .payload(),
+                page_id.to_le_bytes(),
+                "page {page_id}"
+            );
+        }
     }
 
     #[test]
