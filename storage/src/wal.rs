@@ -156,9 +156,7 @@ impl Wal {
                 } else {
                     (records_b, records_a, 0_usize)
                 };
-                let seam_is_monotonic = earlier
-                    .last()
-                    .is_none_or(|last| later[0].lsn > last.lsn);
+                let seam_is_monotonic = earlier.last().is_none_or(|last| later[0].lsn > last.lsn);
                 if seam_is_monotonic {
                     earlier.extend(later);
                     (earlier, later_index)
@@ -216,10 +214,13 @@ impl Wal {
     }
 
     pub(crate) fn finish_recycle(&mut self, boundary_lsn: u64) -> Result<()> {
-        let retired = self.retired.take().ok_or_else(|| StorageError::CorruptWal {
-            offset: 0,
-            reason: "no retired segment to recycle".to_owned(),
-        })?;
+        let retired = self
+            .retired
+            .take()
+            .ok_or_else(|| StorageError::CorruptWal {
+                offset: 0,
+                reason: "no retired segment to recycle".to_owned(),
+            })?;
         self.segments[retired].end_offset = 0;
         self.records.retain(|record| record.lsn.0 >= boundary_lsn);
         Ok(())
@@ -711,7 +712,10 @@ mod tests {
         assert!(wal.both_segments_live());
         let lsns: Vec<u64> = wal.records().iter().map(|record| record.lsn.0).collect();
         assert_eq!(lsns, vec![1, 2, 3, 4], "both segments, in LSN order");
-        assert!(!wal.can_rotate(), "no rotation until a checkpoint clears it");
+        assert!(
+            !wal.can_rotate(),
+            "no rotation until a checkpoint clears it"
+        );
     }
 
     #[test]
@@ -721,7 +725,8 @@ mod tests {
         let mut wal = Wal::open(&primary, &secondary).expect("open WAL");
 
         for lap in 0..3_u64 {
-            wal.append_page(PageId(lap), &lap.to_le_bytes()).expect("append");
+            wal.append_page(PageId(lap), &lap.to_le_bytes())
+                .expect("append");
             wal.append_batch_commit(1).expect("commit");
             wal.sync().expect("sync");
             let boundary = wal.rotate().expect("rotate");
@@ -756,7 +761,8 @@ mod tests {
         assert_eq!(wal.records().len(), 0);
         assert!(!wal.both_segments_live());
 
-        wal.append_page(PageId(3), b"c").expect("append after reset");
+        wal.append_page(PageId(3), b"c")
+            .expect("append after reset");
         assert_eq!(wal.records().len(), 1);
     }
 }

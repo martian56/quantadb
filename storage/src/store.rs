@@ -236,10 +236,7 @@ impl DurableStore {
 
         let lock = open_lock_file(&root)?;
         let data = DataFile::open(&root.join(DATA_FILE_NAME))?;
-        let wal = Wal::open(
-            &root.join(WAL_FILE_NAME),
-            &root.join(WAL_SPARE_FILE_NAME),
-        )?;
+        let wal = Wal::open(&root.join(WAL_FILE_NAME), &root.join(WAL_SPARE_FILE_NAME))?;
         let mut store = Self {
             root,
             data,
@@ -587,10 +584,7 @@ impl DurableStore {
             .write()
             .map_err(|_| StorageError::Poisoned)?;
         for (page_id, lsn) in written {
-            if dirty
-                .get(page_id)
-                .is_some_and(|page| page.lsn() == *lsn)
-            {
+            if dirty.get(page_id).is_some_and(|page| page.lsn() == *lsn) {
                 dirty.remove(page_id);
             }
             if self
@@ -762,10 +756,7 @@ mod tests {
         let job = store.begin_background_checkpoint().expect("begin");
         assert!(store.checkpoint_in_flight());
         assert_eq!(store.wal_size_bytes().expect("size"), 0, "rotated");
-        assert_eq!(
-            store.flush_some_dirty(usize::MAX).expect("paused pacer"),
-            0
-        );
+        assert_eq!(store.flush_some_dirty(usize::MAX).expect("paused pacer"), 0);
 
         // written after the rotation: must survive the checkpoint untouched
         store
@@ -782,11 +773,19 @@ mod tests {
         assert!(store.can_begin_background_checkpoint());
 
         assert_eq!(
-            store.read_page(PageId(1)).expect("read").expect("page").payload(),
+            store
+                .read_page(PageId(1))
+                .expect("read")
+                .expect("page")
+                .payload(),
             b"one"
         );
         assert_eq!(
-            store.read_page(PageId(2)).expect("read").expect("page").payload(),
+            store
+                .read_page(PageId(2))
+                .expect("read")
+                .expect("page")
+                .payload(),
             b"two again"
         );
 
@@ -794,7 +793,11 @@ mod tests {
         let mut reopened =
             DurableStore::open(directory.path(), StoreOptions::default()).expect("reopen");
         assert_eq!(
-            reopened.read_page(PageId(2)).expect("read").expect("page").payload(),
+            reopened
+                .read_page(PageId(2))
+                .expect("read")
+                .expect("page")
+                .payload(),
             b"two again",
             "the post-rotation batch replays from the new active segment"
         );
@@ -816,11 +819,19 @@ mod tests {
             DurableStore::open(directory.path(), StoreOptions::default()).expect("reopen");
         assert!(reopened.can_begin_background_checkpoint(), "consolidated");
         assert_eq!(
-            reopened.read_page(PageId(1)).expect("read").expect("page").payload(),
+            reopened
+                .read_page(PageId(1))
+                .expect("read")
+                .expect("page")
+                .payload(),
             b"old"
         );
         assert_eq!(
-            reopened.read_page(PageId(2)).expect("read").expect("page").payload(),
+            reopened
+                .read_page(PageId(2))
+                .expect("read")
+                .expect("page")
+                .payload(),
             b"new"
         );
     }
@@ -844,7 +855,11 @@ mod tests {
         store.checkpoint().expect("classic repair");
         assert!(store.can_begin_background_checkpoint());
         assert_eq!(
-            store.read_page(PageId(1)).expect("read").expect("page").payload(),
+            store
+                .read_page(PageId(1))
+                .expect("read")
+                .expect("page")
+                .payload(),
             b"one"
         );
     }
@@ -974,10 +989,10 @@ mod tests {
             let directory = tempdir().expect("tempdir");
             {
                 let mut wal = Wal::open(
-                &directory.path().join(WAL_FILE_NAME),
-                &directory.path().join(WAL_SPARE_FILE_NAME),
-            )
-            .expect("open WAL");
+                    &directory.path().join(WAL_FILE_NAME),
+                    &directory.path().join(WAL_SPARE_FILE_NAME),
+                )
+                .expect("open WAL");
                 wal.append_page(PageId(0), b"complete").expect("append");
                 wal.append_batch_commit(1).expect("commit");
                 wal.sync().expect("sync WAL");

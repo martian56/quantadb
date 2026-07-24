@@ -138,7 +138,13 @@ impl GroupCommitter {
         let worker = thread::Builder::new()
             .name("quantadb-group-commit".to_owned())
             .spawn(move || {
-                commit_worker(receiver, worker_store, worker_stats, options, checkpoint_sender);
+                commit_worker(
+                    receiver,
+                    worker_store,
+                    worker_stats,
+                    options,
+                    checkpoint_sender,
+                );
             })?;
 
         Ok(Self {
@@ -179,9 +185,9 @@ impl GroupCommitter {
             .map_err(|_| StorageError::GroupCommit("worker thread panicked".to_owned()))?;
         // the worker's exit drops the only checkpoint sender
         if let Some(checkpointer) = self.checkpointer.take() {
-            checkpointer.join().map_err(|_| {
-                StorageError::GroupCommit("checkpoint thread panicked".to_owned())
-            })?;
+            checkpointer
+                .join()
+                .map_err(|_| StorageError::GroupCommit("checkpoint thread panicked".to_owned()))?;
         }
         Ok(())
     }
