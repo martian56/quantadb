@@ -446,7 +446,7 @@ impl DurableStore {
         let mut grown: std::collections::HashMap<PageId, Vec<u8>> =
             std::collections::HashMap::new();
         for append in appends {
-            if !grown.contains_key(&append.page_id) {
+            if let std::collections::hash_map::Entry::Vacant(slot) = grown.entry(append.page_id) {
                 let cached = {
                     let dirty = self
                         .dirty
@@ -465,7 +465,7 @@ impl DurableStore {
                         .map(|page| page.payload().to_vec())
                         .unwrap_or_default(),
                 };
-                grown.insert(append.page_id, base);
+                slot.insert(base);
             }
             let target = grown.get_mut(&append.page_id).expect("inserted above");
             let combined = target.len().checked_add(append.payload.len()).ok_or(
