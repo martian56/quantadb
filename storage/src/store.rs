@@ -14,6 +14,7 @@ use std::{
 
 const DATA_FILE_NAME: &str = "data.qdb";
 const WAL_FILE_NAME: &str = "wal.qdb";
+const WAL_SPARE_FILE_NAME: &str = "wal2.qdb";
 const LOCK_FILE_NAME: &str = "LOCK";
 static OPEN_DIRECTORIES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
@@ -137,6 +138,49 @@ impl SharedReader {
     }
 }
 
+/// The lock-free part of a checkpoint: write the manifested pages, sync the
+/// data file, then seal the retired segment, in that order.
+pub struct BackgroundCheckpoint {
+    manifest: Vec<(PageId, Lsn)>,
+    dirty: std::sync::Arc<DirtyPages>,
+    data_file: File,
+    retired_file: File,
+    boundary_lsn: u64,
+}
+
+impl BackgroundCheckpoint {
+    /// Holds no store lock; pages re-dirtied since the rotation are skipped.
+    pub fn run(&self) -> Result<Vec<(PageId, Lsn)>> {
+        const CHUNK: usize = 64;
+        let mut written = Vec::with_capacity(self.manifest.len());
+        for manifest_chunk in self.manifest.chunks(CHUNK) {
+            let pages: Vec<Page> = {
+                let dirty = self
+                    .dirty
+                    .pages
+                    .read()
+                    .map_err(|_| StorageError::Poisoned)?;
+                manifest_chunk
+                    .iter()
+                    .filter_map(|(page_id, lsn)| {
+                        dirty
+                            .get(page_id)
+                            .filter(|page| page.lsn() == *lsn)
+                            .cloned()
+                    })
+                    .collect()
+            };
+            for page in &pages {
+                crate::data_file::write_shared(&self.data_file, page)?;
+                written.push((page.id(), page.lsn()));
+            }
+        }
+        crate::data_file::sync_shared(&self.data_file)?;
+        crate::wal::seal_file(&self.retired_file)?;
+        Ok(written)
+    }
+}
+
 /// A strictly durable physical page store.
 ///
 /// Each commit batch synchronizes exactly one file: the WAL. Data pages
@@ -165,6 +209,7 @@ pub struct DurableStore {
     /// so a crash before reuse loses nothing and the releasing layer
     /// rediscovers the same garbage on restart.
     allocator: std::sync::Arc<PageAllocator>,
+    checkpoint_in_flight: bool,
     poisoned: bool,
     _lock: StoreLock,
 }
@@ -191,7 +236,10 @@ impl DurableStore {
 
         let lock = open_lock_file(&root)?;
         let data = DataFile::open(&root.join(DATA_FILE_NAME))?;
-        let wal = Wal::open(&root.join(WAL_FILE_NAME))?;
+        let wal = Wal::open(
+            &root.join(WAL_FILE_NAME),
+            &root.join(WAL_SPARE_FILE_NAME),
+        )?;
         let mut store = Self {
             root,
             data,
@@ -207,6 +255,7 @@ impl DurableStore {
                     free_pages: std::collections::BTreeSet::new(),
                 }),
             }),
+            checkpoint_in_flight: false,
             poisoned: false,
             _lock: lock,
         };
@@ -221,6 +270,10 @@ impl DurableStore {
             .map_err(|_| StorageError::Poisoned)?
             .next_page_id = next_page_id;
         store.wal.trim_records_to_last_checkpoint();
+        if store.wal.both_segments_live() {
+            // consolidate after a crash mid-rotation so a spare is empty again
+            store.checkpoint()?;
+        }
         Ok(store)
     }
 
@@ -353,6 +406,12 @@ impl DurableStore {
         if self.poisoned {
             return Err(StorageError::Poisoned);
         }
+        if self.checkpoint_in_flight {
+            return Err(StorageError::Configuration(
+                "cannot run a full checkpoint while a background checkpoint is in flight"
+                    .to_owned(),
+            ));
+        }
         let result = self.checkpoint_inner();
         if result.is_err() {
             self.poisoned = true;
@@ -392,6 +451,10 @@ impl DurableStore {
     /// commits wait. Pages stay in the dirty table because they are not
     /// durable in the data file until that sync.
     pub fn flush_some_dirty(&mut self, budget: usize) -> Result<usize> {
+        if self.checkpoint_in_flight {
+            // paced writes could race the checkpointer's lock-free page writes
+            return Ok(0);
+        }
         let pending: Vec<Page> = {
             let dirty = self
                 .dirty
@@ -454,6 +517,96 @@ impl DurableStore {
     /// Current size of the log on disk, which only a checkpoint shrinks.
     pub fn wal_size_bytes(&self) -> Result<u64> {
         self.wal.size_bytes()
+    }
+
+    #[must_use]
+    pub fn checkpoint_in_flight(&self) -> bool {
+        self.checkpoint_in_flight
+    }
+
+    #[must_use]
+    pub fn can_begin_background_checkpoint(&self) -> bool {
+        !self.checkpoint_in_flight && !self.poisoned && self.wal.can_rotate()
+    }
+
+    /// Rotates the log and snapshots dirty page IDs and LSNs, no payloads.
+    pub fn begin_background_checkpoint(&mut self) -> Result<BackgroundCheckpoint> {
+        if self.poisoned {
+            return Err(StorageError::Poisoned);
+        }
+        if self.checkpoint_in_flight {
+            return Err(StorageError::Configuration(
+                "a background checkpoint is already in flight".to_owned(),
+            ));
+        }
+        let boundary_lsn = self.wal.rotate()?;
+        let manifest = {
+            let dirty = self
+                .dirty
+                .pages
+                .read()
+                .map_err(|_| StorageError::Poisoned)?;
+            dirty
+                .iter()
+                .map(|(page_id, page)| (*page_id, page.lsn()))
+                .collect()
+        };
+        self.checkpoint_in_flight = true;
+        Ok(BackgroundCheckpoint {
+            manifest,
+            dirty: std::sync::Arc::clone(&self.dirty),
+            data_file: self.data.share()?,
+            retired_file: self.wal.retired_file()?,
+            boundary_lsn,
+        })
+    }
+
+    /// Pages leave the dirty table only if they still carry the written LSN.
+    pub fn complete_background_checkpoint(
+        &mut self,
+        job: &BackgroundCheckpoint,
+        written: &[(PageId, Lsn)],
+    ) -> Result<()> {
+        let result = self.complete_background_checkpoint_inner(job, written);
+        self.checkpoint_in_flight = false;
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn complete_background_checkpoint_inner(
+        &mut self,
+        job: &BackgroundCheckpoint,
+        written: &[(PageId, Lsn)],
+    ) -> Result<()> {
+        self.wal.finish_recycle(job.boundary_lsn)?;
+        let mut dirty = self
+            .dirty
+            .pages
+            .write()
+            .map_err(|_| StorageError::Poisoned)?;
+        for (page_id, lsn) in written {
+            if dirty
+                .get(page_id)
+                .is_some_and(|page| page.lsn() == *lsn)
+            {
+                dirty.remove(page_id);
+            }
+            if self
+                .flushed
+                .get(page_id)
+                .is_some_and(|flushed| flushed == lsn)
+            {
+                self.flushed.remove(page_id);
+            }
+        }
+        Ok(())
+    }
+
+    /// The retired segment stays unrecycled; a classic checkpoint repairs it.
+    pub fn abort_background_checkpoint(&mut self) {
+        self.checkpoint_in_flight = false;
     }
 
     fn recover(&mut self) -> Result<()> {
@@ -598,6 +751,105 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn background_checkpoint_flushes_and_recycles_off_the_lock() {
+        let directory = tempdir().expect("tempdir");
+        let mut store =
+            DurableStore::open(directory.path(), StoreOptions::default()).expect("open store");
+        store.write_page(PageId(1), b"one".to_vec()).expect("write");
+        store.write_page(PageId(2), b"two".to_vec()).expect("write");
+        assert!(store.wal_size_bytes().expect("size") > 0);
+
+        let job = store.begin_background_checkpoint().expect("begin");
+        assert!(store.checkpoint_in_flight());
+        assert_eq!(store.wal_size_bytes().expect("size"), 0, "rotated");
+        assert_eq!(
+            store.flush_some_dirty(usize::MAX).expect("paused pacer"),
+            0
+        );
+
+        // written after the rotation: must survive the checkpoint untouched
+        store
+            .write_page(PageId(2), b"two again".to_vec())
+            .expect("re-dirty");
+
+        let written = job.run().expect("run");
+        assert_eq!(written.len(), 1, "the re-dirtied page was skipped");
+        assert_eq!(written[0].0, PageId(1));
+        store
+            .complete_background_checkpoint(&job, &written)
+            .expect("complete");
+        assert!(!store.checkpoint_in_flight());
+        assert!(store.can_begin_background_checkpoint());
+
+        assert_eq!(
+            store.read_page(PageId(1)).expect("read").expect("page").payload(),
+            b"one"
+        );
+        assert_eq!(
+            store.read_page(PageId(2)).expect("read").expect("page").payload(),
+            b"two again"
+        );
+
+        drop(store);
+        let mut reopened =
+            DurableStore::open(directory.path(), StoreOptions::default()).expect("reopen");
+        assert_eq!(
+            reopened.read_page(PageId(2)).expect("read").expect("page").payload(),
+            b"two again",
+            "the post-rotation batch replays from the new active segment"
+        );
+    }
+
+    #[test]
+    fn reopen_after_crash_between_rotation_and_recycle_consolidates() {
+        let directory = tempdir().expect("tempdir");
+        {
+            let mut store =
+                DurableStore::open(directory.path(), StoreOptions::default()).expect("open");
+            store.write_page(PageId(1), b"old".to_vec()).expect("write");
+            let job = store.begin_background_checkpoint().expect("begin");
+            store.write_page(PageId(2), b"new".to_vec()).expect("write");
+            drop(job); // crash: the job never ran
+        }
+
+        let mut reopened =
+            DurableStore::open(directory.path(), StoreOptions::default()).expect("reopen");
+        assert!(reopened.can_begin_background_checkpoint(), "consolidated");
+        assert_eq!(
+            reopened.read_page(PageId(1)).expect("read").expect("page").payload(),
+            b"old"
+        );
+        assert_eq!(
+            reopened.read_page(PageId(2)).expect("read").expect("page").payload(),
+            b"new"
+        );
+    }
+
+    #[test]
+    fn a_classic_checkpoint_repairs_an_aborted_background_one() {
+        let directory = tempdir().expect("tempdir");
+        let mut store =
+            DurableStore::open(directory.path(), StoreOptions::default()).expect("open store");
+        store.write_page(PageId(1), b"one".to_vec()).expect("write");
+
+        let job = store.begin_background_checkpoint().expect("begin");
+        drop(job);
+        store.abort_background_checkpoint();
+        assert!(!store.checkpoint_in_flight());
+        assert!(
+            !store.can_begin_background_checkpoint(),
+            "the retired segment is still waiting"
+        );
+
+        store.checkpoint().expect("classic repair");
+        assert!(store.can_begin_background_checkpoint());
+        assert_eq!(
+            store.read_page(PageId(1)).expect("read").expect("page").payload(),
+            b"one"
+        );
+    }
+
+    #[test]
     fn durable_pages_survive_reopen() {
         let directory = tempdir().expect("tempdir");
         let page_id;
@@ -658,7 +910,11 @@ mod tests {
     fn recovery_replays_a_wal_record_missing_from_the_data_file() {
         let directory = tempdir().expect("tempdir");
         {
-            let mut wal = Wal::open(&directory.path().join(WAL_FILE_NAME)).expect("open WAL");
+            let mut wal = Wal::open(
+                &directory.path().join(WAL_FILE_NAME),
+                &directory.path().join(WAL_SPARE_FILE_NAME),
+            )
+            .expect("open WAL");
             wal.append_page(PageId(7), b"redo me").expect("append");
             wal.append_batch_commit(1).expect("commit");
             wal.sync().expect("sync WAL");
@@ -717,7 +973,11 @@ mod tests {
         for cut in [1_usize, 4, 63, 64, PAGE_SIZE / 2, PAGE_SIZE - 1] {
             let directory = tempdir().expect("tempdir");
             {
-                let mut wal = Wal::open(&directory.path().join(WAL_FILE_NAME)).expect("open WAL");
+                let mut wal = Wal::open(
+                &directory.path().join(WAL_FILE_NAME),
+                &directory.path().join(WAL_SPARE_FILE_NAME),
+            )
+            .expect("open WAL");
                 wal.append_page(PageId(0), b"complete").expect("append");
                 wal.append_batch_commit(1).expect("commit");
                 wal.sync().expect("sync WAL");
@@ -755,7 +1015,11 @@ mod tests {
             store.checkpoint().expect("checkpoint");
         }
         {
-            let mut wal = Wal::open(&directory.path().join(WAL_FILE_NAME)).expect("open WAL");
+            let mut wal = Wal::open(
+                &directory.path().join(WAL_FILE_NAME),
+                &directory.path().join(WAL_SPARE_FILE_NAME),
+            )
+            .expect("open WAL");
             wal.ensure_next_lsn_after(1).expect("resume LSNs");
             wal.append_page(PageId(1), b"after").expect("append");
             wal.append_batch_commit(1).expect("commit");
@@ -936,7 +1200,11 @@ mod tests {
     fn recovery_ignores_page_images_without_a_batch_commit() {
         let directory = tempdir().expect("tempdir");
         {
-            let mut wal = Wal::open(&directory.path().join(WAL_FILE_NAME)).expect("open WAL");
+            let mut wal = Wal::open(
+                &directory.path().join(WAL_FILE_NAME),
+                &directory.path().join(WAL_SPARE_FILE_NAME),
+            )
+            .expect("open WAL");
             wal.append_page(PageId(5), b"uncommitted").expect("append");
             wal.sync().expect("sync uncommitted WAL");
         }
@@ -950,7 +1218,11 @@ mod tests {
     fn recovery_replays_all_pages_of_a_committed_batch() {
         let directory = tempdir().expect("tempdir");
         {
-            let mut wal = Wal::open(&directory.path().join(WAL_FILE_NAME)).expect("open WAL");
+            let mut wal = Wal::open(
+                &directory.path().join(WAL_FILE_NAME),
+                &directory.path().join(WAL_SPARE_FILE_NAME),
+            )
+            .expect("open WAL");
             wal.append_page(PageId(20), b"twenty").expect("append");
             wal.append_page(PageId(21), b"twenty-one").expect("append");
             wal.append_batch_commit(2).expect("commit");
@@ -981,7 +1253,11 @@ mod tests {
     fn a_new_commit_does_not_adopt_an_old_uncommitted_tail() {
         let directory = tempdir().expect("tempdir");
         {
-            let mut wal = Wal::open(&directory.path().join(WAL_FILE_NAME)).expect("open WAL");
+            let mut wal = Wal::open(
+                &directory.path().join(WAL_FILE_NAME),
+                &directory.path().join(WAL_SPARE_FILE_NAME),
+            )
+            .expect("open WAL");
             wal.append_page(PageId(30), b"abandoned").expect("append");
             wal.sync().expect("sync abandoned page");
         }
