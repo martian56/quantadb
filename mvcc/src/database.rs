@@ -2,7 +2,7 @@ use crate::{index_manifest::IndexGeneration, record::VersionRecord, Result, Tran
 use quantadb_index::{BPlusTree, IndexEntry, IndexMutation, IndexRoot, NodeCache, NodeCacheStats};
 use quantadb_storage::{
     ByteCacheStats, DurableStore, GroupCommitHandle, GroupCommitOptions, GroupCommitStats,
-    GroupCommitter, PageId, PageWrite, SharedByteLru, StoreOptions,
+    GroupCommitter, PageAppend, PageId, PageWrite, SharedByteLru, StoreOptions, MAX_PAGE_PAYLOAD,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -84,6 +84,8 @@ struct Version {
 
 struct State {
     versions: BTreeMap<Vec<u8>, Vec<Version>>,
+    /// Live versions per page. A packed page is only free at zero.
+    page_refs: HashMap<PageId, u32>,
     intents: HashMap<Vec<u8>, TransactionId>,
     active: HashMap<TransactionId, Timestamp>,
     completed_timestamps: BTreeSet<u64>,
@@ -159,7 +161,7 @@ impl State {
     /// A pruned generation's manifest page is unreachable because restart
     /// selection only ever uses the newest manifest. Shared copy-on-write
     /// index nodes are not freed; that needs reachability tracking.
-    fn reclaim_covered(&mut self) -> Vec<PageId> {
+    fn reclaim_covered(&mut self, protect: Option<PageId>) -> Vec<PageId> {
         let mut freed = Vec::new();
         let oldest_active = self.oldest_active_snapshot();
         if let Some(cover_position) = self
@@ -181,18 +183,31 @@ impl State {
             intents,
             dirty_keys,
             reclaimed_versions,
+            page_refs,
             ..
         } = self;
+        // A page is shared by many versions, so it only becomes free when
+        // the last of them goes. The page still collecting records is never
+        // freed, however empty it looks.
+        let mut release = |page_id: PageId, freed: &mut Vec<PageId>| {
+            if let Some(remaining) = page_refs.get_mut(&page_id) {
+                *remaining = remaining.saturating_sub(1);
+                if *remaining == 0 {
+                    page_refs.remove(&page_id);
+                    if protect != Some(page_id) {
+                        freed.push(page_id);
+                    }
+                }
+            }
+        };
         versions.retain(|key, key_versions| {
             if let Some(newest_visible) = key_versions
                 .iter()
                 .rposition(|version| version.timestamp <= oldest_active)
             {
-                freed.extend(
-                    key_versions
-                        .drain(..newest_visible)
-                        .map(|version| version.page_id),
-                );
+                for version in key_versions.drain(..newest_visible) {
+                    release(version.page_id, &mut freed);
+                }
                 *reclaimed_versions += newest_visible as u64;
             }
             let Some(cover) = cover else {
@@ -217,11 +232,20 @@ struct PublishSignal {
     stop: bool,
 }
 
+/// The page currently collecting version records, and where the next one
+/// goes. Records are packed so a page reaches the data file once instead
+/// of once per version.
+struct OpenPage {
+    page_id: PageId,
+    offset: u32,
+}
+
 struct Inner {
     state: Mutex<State>,
     storage: GroupCommitHandle,
     node_cache: NodeCache,
-    record_cache: SharedByteLru<VersionRecord>,
+    open_page: Mutex<Option<OpenPage>>,
+    record_cache: SharedByteLru<Vec<VersionRecord>>,
     publish_signal: Mutex<PublishSignal>,
     publish_wake: Condvar,
 }
@@ -250,6 +274,7 @@ impl MvccDatabase {
     pub fn open(path: impl AsRef<Path>, options: MvccOptions) -> Result<Self> {
         let mut store = DurableStore::open(path, options.store)?;
         let mut versions: BTreeMap<Vec<u8>, Vec<Version>> = BTreeMap::new();
+        let mut page_refs: HashMap<PageId, u32> = HashMap::new();
         let mut index_generations = Vec::new();
         let mut maximum_timestamp = 0_u64;
 
@@ -262,28 +287,28 @@ impl MvccDatabase {
                 index_generations.push(generation);
                 continue;
             }
-            let Some(record) = VersionRecord::decode(page_id, page.payload())? else {
-                continue;
-            };
-            maximum_timestamp = maximum_timestamp.max(record.timestamp.0);
-            let key_versions = versions.entry(record.key).or_default();
-            if key_versions
-                .iter()
-                .any(|version| version.timestamp == record.timestamp)
-            {
-                return Err(TransactionError::CorruptRecord {
+            for record in VersionRecord::decode_page(page_id, page.payload())? {
+                maximum_timestamp = maximum_timestamp.max(record.timestamp.0);
+                let key_versions = versions.entry(record.key).or_default();
+                if key_versions
+                    .iter()
+                    .any(|version| version.timestamp == record.timestamp)
+                {
+                    return Err(TransactionError::CorruptRecord {
+                        page_id,
+                        reason: format!(
+                            "duplicate version timestamp {} for one key",
+                            record.timestamp.0
+                        ),
+                    });
+                }
+                key_versions.push(Version {
+                    timestamp: record.timestamp,
+                    value: record.value,
                     page_id,
-                    reason: format!(
-                        "duplicate version timestamp {} for one key",
-                        record.timestamp.0
-                    ),
                 });
+                *page_refs.entry(page_id).or_insert(0) += 1;
             }
-            key_versions.push(Version {
-                timestamp: record.timestamp,
-                value: record.value,
-                page_id,
-            });
         }
         for key_versions in versions.values_mut() {
             key_versions.sort_unstable_by_key(|version| version.timestamp);
@@ -317,6 +342,7 @@ impl MvccDatabase {
             .collect();
         let needs_catch_up = !dirty_keys.is_empty();
         let mut state = State {
+            page_refs,
             versions,
             intents: HashMap::new(),
             active: HashMap::new(),
@@ -328,9 +354,10 @@ impl MvccDatabase {
             dirty_keys,
             reclaimed_versions: 0,
         };
-        let freed_at_open = state.reclaim_covered();
+        let freed_at_open = state.reclaim_covered(None);
         storage.release_pages(freed_at_open)?;
         let inner = Arc::new(Inner {
+            open_page: Mutex::new(None),
             state: Mutex::new(state),
             storage,
             node_cache: NodeCache::new(options.index_cache_bytes),
@@ -579,7 +606,13 @@ impl Inner {
                 versions.iter().any(|version| version.timestamp > timestamp)
             })
         });
-        let freed = state.reclaim_covered();
+        let open_page_id = self
+            .open_page
+            .lock()
+            .map_err(|_| TransactionError::StatePoisoned)?
+            .as_ref()
+            .map(|page| page.page_id);
+        let freed = state.reclaim_covered(open_page_id);
         drop(state);
         // Freed pages can be reused with new content, so any cached decode
         // of their old content has to go before the IDs recirculate.
@@ -640,8 +673,8 @@ impl Inner {
         key: &[u8],
         snapshot: Timestamp,
     ) -> Result<Option<Vec<u8>>> {
-        let record = match self.record_cache.get(page_id) {
-            Some(record) => record,
+        let records = match self.record_cache.get(page_id) {
+            Some(records) => records,
             None => {
                 let page = self.storage.read_page(page_id)?.ok_or_else(|| {
                     TransactionError::CorruptRecord {
@@ -649,31 +682,32 @@ impl Inner {
                         reason: "index points to an absent version page".to_owned(),
                     }
                 })?;
-                let record = VersionRecord::decode(page_id, page.payload())?.ok_or_else(|| {
-                    TransactionError::CorruptRecord {
+                let records = Arc::new(VersionRecord::decode_page(page_id, page.payload())?);
+                if records.is_empty() {
+                    return Err(TransactionError::CorruptRecord {
                         page_id,
                         reason: "index points to a non-MVCC page".to_owned(),
-                    }
-                })?;
-                let record = Arc::new(record);
-                self.record_cache
-                    .insert(page_id, &record, record.approximate_bytes());
-                record
+                    });
+                }
+                let bytes = records
+                    .iter()
+                    .map(VersionRecord::approximate_bytes)
+                    .sum::<usize>();
+                self.record_cache.insert(page_id, &records, bytes);
+                records
             }
         };
-        if record.key != key {
-            return Err(TransactionError::CorruptRecord {
+        // The page holds records for many keys, and possibly several
+        // versions of this one, so take the newest the snapshot can see.
+        let visible = records
+            .iter()
+            .filter(|record| record.key == key && record.timestamp <= snapshot)
+            .max_by_key(|record| record.timestamp)
+            .ok_or_else(|| TransactionError::CorruptRecord {
                 page_id,
-                reason: "index key does not match version-record key".to_owned(),
-            });
-        }
-        if record.timestamp > snapshot || record.value.is_none() {
-            return Err(TransactionError::CorruptRecord {
-                page_id,
-                reason: "index points to a version that is not live in its snapshot".to_owned(),
-            });
-        }
-        Ok(record.value.clone())
+                reason: "index points to a page holding no visible version of the key".to_owned(),
+            })?;
+        Ok(visible.value.clone())
     }
 
     fn prepare_commit(
@@ -742,30 +776,70 @@ impl Inner {
         timestamp: Timestamp,
         writes: &[(Vec<u8>, Option<Vec<u8>>)],
     ) -> Result<Vec<PageId>> {
-        let page_ids = self.storage.reserve_page_ids(writes.len())?;
-        let page_writes = writes
-            .iter()
-            .zip(&page_ids)
-            .map(|((key, value), page_id)| {
+        let mut appends: Vec<PageAppend> = Vec::with_capacity(writes.len());
+        let mut page_ids: Vec<PageId> = Vec::with_capacity(writes.len());
+        {
+            let mut open = self
+                .open_page
+                .lock()
+                .map_err(|_| TransactionError::StatePoisoned)?;
+            for (key, value) in writes {
                 let record = VersionRecord {
                     timestamp,
                     key: key.clone(),
                     value: value.clone(),
                 };
                 let payload = record.encode()?;
-                if record.value.is_some() {
-                    let record = Arc::new(record);
-                    self.record_cache
-                        .insert(*page_id, &record, record.approximate_bytes());
+                let rolls_over = open
+                    .as_ref()
+                    .is_none_or(|page| page.offset as usize + payload.len() > MAX_PAGE_PAYLOAD);
+                if rolls_over {
+                    // Seal the page being left behind so it reaches the data
+                    // file once, as a finished page.
+                    if let Some(previous) = open.take() {
+                        appends.push(PageAppend {
+                            page_id: previous.page_id,
+                            offset: previous.offset,
+                            payload: Vec::new(),
+                            sealed: true,
+                        });
+                    }
+                    let page_id = self
+                        .storage
+                        .reserve_page_ids(1)?
+                        .into_iter()
+                        .next()
+                        .ok_or(TransactionError::TimestampExhausted)?;
+                    // A page off the free pool still holds the records of its
+                    // previous life. Blank it here, while the open page lock
+                    // is held, so it is empty before any writer can append to
+                    // it. Clearing it as part of an append would depend on
+                    // which writer reached the log first.
+                    self.storage.commit_relaxed(vec![PageWrite {
+                        page_id,
+                        payload: Vec::new(),
+                    }])?;
+                    *open = Some(OpenPage { page_id, offset: 0 });
                 }
-                Ok(PageWrite {
-                    page_id: *page_id,
-                    payload,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let lsns = self.storage.commit(page_writes)?;
-        if lsns.len() != writes.len() {
+                let page = open.as_mut().expect("a page is open");
+                appends.push(PageAppend {
+                    page_id: page.page_id,
+                    offset: page.offset,
+                    payload: payload.clone(),
+                    sealed: false,
+                });
+                page_ids.push(page.page_id);
+                page.offset += payload.len() as u32;
+            }
+        }
+        let lsns = self.storage.append(appends)?;
+        // Appending changed the page, so any decode of it is out of date.
+        // This has to follow the append: dropping it first would let a
+        // reader refill the cache from the older content.
+        for page_id in &page_ids {
+            self.record_cache.remove(*page_id);
+        }
+        if lsns.len() < writes.len() {
             return Err(TransactionError::Storage(
                 quantadb_storage::StorageError::GroupCommit(format!(
                     "commit returned {} LSNs for {} writes",
@@ -817,6 +891,7 @@ impl Inner {
                         page_id: *page_id,
                     },
                 );
+                *state.page_refs.entry(*page_id).or_insert(0) += 1;
                 state.dirty_keys.insert(key.clone());
             }
         }
@@ -1547,44 +1622,64 @@ mod tests {
     }
 
     #[test]
-    fn reclaimed_version_pages_are_freed_and_reused() {
+    fn a_packed_page_is_freed_once_every_record_on_it_is_dead() {
         let directory = tempdir().expect("tempdir");
         {
             let database = open_database(directory.path());
-            let mut first = database.begin().expect("begin first");
-            first.put(b"hot", b"v1").expect("put v1");
-            first.commit().expect("commit v1");
-            let mut second = database.begin().expect("begin second");
-            second.put(b"hot", b"v2").expect("put v2");
-            second.commit().expect("commit v2");
+            // Values large enough that a handful of versions fill a page,
+            // so the older pages end up holding nothing live.
+            for round in 0..40_u8 {
+                let mut transaction = database.begin().expect("begin");
+                transaction
+                    .put(b"hot", vec![round; 800].as_slice())
+                    .expect("put version");
+                transaction.commit().expect("commit version");
+            }
 
             database.rebuild_index().expect("rebuild");
             let stats = database.stats().expect("stats");
             assert!(
                 stats.free_pages >= 1,
-                "the drained old version's page must be free: {stats:?}"
+                "pages whose every record was superseded must be free: {stats:?}"
             );
-
-            let free_before = stats.free_pages;
-            let mut third = database.begin().expect("begin third");
-            third.put(b"hot", b"v3").expect("put v3");
-            third.commit().expect("commit v3");
-            let stats = database.stats().expect("stats");
-            assert!(
-                stats.free_pages < free_before,
-                "the new version must have reused a freed page: {stats:?}"
+            assert_eq!(
+                database.get(b"hot").expect("get"),
+                Some(vec![39_u8; 800]),
+                "the surviving version is still readable"
             );
-            assert_eq!(database.get(b"hot").expect("get"), Some(b"v3".to_vec()));
             database.shutdown().expect("shutdown");
         }
 
         let database = open_database(directory.path());
         assert_eq!(
             database.get(b"hot").expect("get after restart"),
-            Some(b"v3".to_vec()),
-            "reuse must survive a restart"
+            Some(vec![39_u8; 800]),
+            "packing must survive a restart"
         );
         database.shutdown().expect("shutdown reopened");
+    }
+
+    #[test]
+    fn a_page_holding_one_live_record_is_kept() {
+        let directory = tempdir().expect("tempdir");
+        let database = open_database(directory.path());
+        let mut first = database.begin().expect("begin first");
+        first.put(b"hot", b"v1").expect("put v1");
+        first.commit().expect("commit v1");
+        let mut second = database.begin().expect("begin second");
+        second.put(b"hot", b"v2").expect("put v2");
+        second.commit().expect("commit v2");
+
+        database.rebuild_index().expect("rebuild");
+        // Both versions are small enough to share one page, and the newer
+        // one is still live, so nothing may be handed back.
+        assert_eq!(
+            database.stats().expect("stats").free_pages,
+            0,
+            "a page with a live record must not be reused"
+        );
+        assert_eq!(database.get(b"hot").expect("get"), Some(b"v2".to_vec()));
+        database.shutdown().expect("shutdown");
     }
 
     #[test]
@@ -1592,17 +1687,18 @@ mod tests {
         let directory = tempdir().expect("tempdir");
         {
             let database = open_database(directory.path());
-            let mut first = database.begin().expect("begin first");
-            first.put(b"key", b"old").expect("put old");
-            first.commit().expect("commit old");
-            let mut second = database.begin().expect("begin second");
-            second.put(b"key", b"new").expect("put new");
-            second.commit().expect("commit new");
+            for round in 0..40_u8 {
+                let mut transaction = database.begin().expect("begin");
+                transaction
+                    .put(b"key", vec![round; 800].as_slice())
+                    .expect("put");
+                transaction.commit().expect("commit");
+            }
             database
                 .rebuild_index()
-                .expect("rebuild frees the old page");
+                .expect("rebuild frees the dead pages");
             assert!(database.stats().expect("stats").free_pages >= 1);
-            // Shut down without reusing the freed page, like a quiet crash.
+            // Shut down without reusing the freed pages, like a quiet crash.
             database.shutdown().expect("shutdown");
         }
 
@@ -1610,9 +1706,9 @@ mod tests {
         let stats = database.stats().expect("stats");
         assert!(
             stats.free_pages >= 1,
-            "the open sweep must rediscover the stale page as free: {stats:?}"
+            "the open sweep must rediscover the stale pages as free: {stats:?}"
         );
-        assert_eq!(database.get(b"key").expect("get"), Some(b"new".to_vec()));
+        assert_eq!(database.get(b"key").expect("get"), Some(vec![39_u8; 800]));
         database.shutdown().expect("shutdown reopened");
     }
 

@@ -1,6 +1,6 @@
 use crate::{
     store::{BackgroundCheckpoint, PageAllocator, SharedReader},
-    DurableStore, Lsn, Page, PageId, PageWrite, Result, StorageError, MAX_PAGE_PAYLOAD,
+    DurableStore, Lsn, Page, PageAppend, PageId, PageWrite, Result, StorageError, MAX_PAGE_PAYLOAD,
 };
 use std::{
     sync::{
@@ -93,8 +93,15 @@ impl AtomicStats {
 
 struct CommitRequest {
     writes: Vec<PageWrite>,
+    appends: Vec<PageAppend>,
     durable: bool,
     response: SyncSender<Result<Vec<Lsn>>>,
+}
+
+impl CommitRequest {
+    fn len(&self) -> usize {
+        self.writes.len() + self.appends.len()
+    }
 }
 
 enum Command {
@@ -214,6 +221,15 @@ impl GroupCommitHandle {
         self.commit_with(writes, false)
     }
 
+    /// Add records to pages instead of replacing them, sealing the ones the
+    /// caller says are finished.
+    pub fn append(&self, appends: Vec<PageAppend>) -> Result<Vec<Lsn>> {
+        if appends.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.submit(Vec::new(), appends, true)
+    }
+
     fn commit_with(&self, writes: Vec<PageWrite>, durable: bool) -> Result<Vec<Lsn>> {
         if writes.is_empty() {
             return Ok(Vec::new());
@@ -226,11 +242,20 @@ impl GroupCommitHandle {
                 });
             }
         }
+        self.submit(writes, Vec::new(), durable)
+    }
 
+    fn submit(
+        &self,
+        writes: Vec<PageWrite>,
+        appends: Vec<PageAppend>,
+        durable: bool,
+    ) -> Result<Vec<Lsn>> {
         let (sender, receiver) = mpsc::sync_channel(0);
         self.sender
             .send(Command::Commit(CommitRequest {
                 writes,
+                appends,
                 durable,
                 response: sender,
             }))
@@ -303,7 +328,7 @@ fn commit_worker(
         match command {
             Command::Commit(first) => {
                 let mut requests = vec![first];
-                let mut page_count = requests[0].writes.len();
+                let mut page_count = requests[0].len();
                 let deadline = Instant::now() + options.max_delay;
 
                 while page_count < options.max_batch_pages {
@@ -313,7 +338,7 @@ fn commit_worker(
                     }
                     match receiver.recv_timeout(remaining) {
                         Ok(Command::Commit(request)) => {
-                            page_count = page_count.saturating_add(request.writes.len());
+                            page_count = page_count.saturating_add(request.len());
                             requests.push(request);
                         }
                         Ok(other) => {
@@ -422,28 +447,32 @@ fn explicit_checkpoint(store: &Mutex<DurableStore>) -> Result<Lsn> {
 
 fn execute_group(store: &Mutex<DurableStore>, stats: &AtomicStats, requests: Vec<CommitRequest>) {
     let request_count = requests.len();
-    let page_count = requests
-        .iter()
-        .map(|request| request.writes.len())
-        .sum::<usize>();
-    let boundaries = requests
-        .iter()
-        .scan(0_usize, |offset, request| {
-            let start = *offset;
-            *offset = offset.saturating_add(request.writes.len());
-            Some((start, *offset))
-        })
-        .collect::<Vec<_>>();
+    let page_count = requests.iter().map(CommitRequest::len).sum::<usize>();
+    // Each request draws its LSNs from whichever list it contributed to.
+    let mut write_spans = Vec::with_capacity(requests.len());
+    let mut append_spans = Vec::with_capacity(requests.len());
+    let mut write_at = 0_usize;
+    let mut append_at = 0_usize;
+    for request in &requests {
+        write_spans.push((write_at, write_at + request.writes.len()));
+        write_at += request.writes.len();
+        append_spans.push((append_at, append_at + request.appends.len()));
+        append_at += request.appends.len();
+    }
     let writes = requests
         .iter()
         .flat_map(|request| request.writes.iter().cloned())
+        .collect::<Vec<_>>();
+    let appends = requests
+        .iter()
+        .flat_map(|request| request.appends.iter().cloned())
         .collect::<Vec<_>>();
 
     let durable = requests.iter().any(|request| request.durable);
     let result = store
         .lock()
         .map_err(|_| StorageError::GroupCommit("store mutex is poisoned".to_owned()))
-        .and_then(|mut store| store.write_pages_with(writes, durable));
+        .and_then(|mut store| store.apply_batch(&writes, &appends, durable));
 
     stats.groups.fetch_add(1, Ordering::Relaxed);
     stats
@@ -452,9 +481,16 @@ fn execute_group(store: &Mutex<DurableStore>, stats: &AtomicStats, requests: Vec
     stats.pages.fetch_add(page_count as u64, Ordering::Relaxed);
 
     match result {
-        Ok(lsns) => {
-            for (request, (start, end)) in requests.into_iter().zip(boundaries) {
-                let _ = request.response.send(Ok(lsns[start..end].to_vec()));
+        Ok((write_lsns, append_lsns)) => {
+            for ((request, writes), appends) in
+                requests.into_iter().zip(write_spans).zip(append_spans)
+            {
+                let lsns = if request.appends.is_empty() {
+                    write_lsns[writes.0..writes.1].to_vec()
+                } else {
+                    append_lsns[appends.0..appends.1].to_vec()
+                };
+                let _ = request.response.send(Ok(lsns));
             }
         }
         Err(error) => {

@@ -38,6 +38,13 @@ pub struct PageAppend {
     pub page_id: PageId,
     pub offset: u32,
     pub payload: Vec<u8>,
+    /// Whether the page is finished and may be written to the data file.
+    ///
+    /// A page still collecting records is written once, when it is sealed,
+    /// rather than once per record. Until then the log is what protects it,
+    /// which is the whole point of packing: a record costs the log its own
+    /// size and costs the data file nothing until the page fills.
+    pub sealed: bool,
 }
 
 impl Default for StoreOptions {
@@ -220,6 +227,8 @@ pub struct DurableStore {
     /// so a crash before reuse loses nothing and the releasing layer
     /// rediscovers the same garbage on restart.
     allocator: std::sync::Arc<PageAllocator>,
+    /// Pages still collecting appends, kept out of the flush queue.
+    open_pages: HashSet<PageId>,
     checkpoint_in_flight: bool,
     poisoned: bool,
     _lock: StoreLock,
@@ -263,6 +272,7 @@ impl DurableStore {
                     free_pages: std::collections::BTreeSet::new(),
                 }),
             }),
+            open_pages: HashSet::new(),
             checkpoint_in_flight: false,
             poisoned: false,
             _lock: lock,
@@ -468,13 +478,13 @@ impl DurableStore {
                         .get(&append.page_id)
                         .map(|page| page.payload().to_vec())
                 };
-                let base = match cached {
-                    Some(payload) => payload,
-                    None => self
-                        .data
+                let base = if let Some(payload) = cached {
+                    payload
+                } else {
+                    self.data
                         .read(append.page_id)?
                         .map(|page| page.payload().to_vec())
-                        .unwrap_or_default(),
+                        .unwrap_or_default()
                 };
                 slot.insert(base);
             }
@@ -516,13 +526,65 @@ impl DurableStore {
             .pages
             .write()
             .map_err(|_| StorageError::Poisoned)?;
+        let sealed: std::collections::HashSet<PageId> = appends
+            .iter()
+            .filter(|append| append.sealed)
+            .map(|append| append.page_id)
+            .collect();
         for (page_id, payload) in grown {
             let lsn = newest[&page_id];
             dirty.insert(page_id, Page::with_lsn(page_id, lsn, payload)?);
-            self.flush_queue.push_back(page_id);
+            if sealed.contains(&page_id) {
+                self.open_pages.remove(&page_id);
+                self.flush_queue.push_back(page_id);
+            } else {
+                self.open_pages.insert(page_id);
+            }
             self.allocator.note_written(page_id)?;
         }
         Ok(lsns)
+    }
+
+    /// Log page replacements and page appends together under one sync.
+    ///
+    /// Each kind still forms its own batch in the log, so a crash keeps or
+    /// drops each as a unit; the single sync is what they share.
+    pub fn apply_batch(
+        &mut self,
+        writes: &[PageWrite],
+        appends: &[PageAppend],
+        durable: bool,
+    ) -> Result<(Vec<Lsn>, Vec<Lsn>)> {
+        if self.poisoned {
+            return Err(StorageError::Poisoned);
+        }
+        let result = self.apply_batch_inner(writes, appends, durable);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn apply_batch_inner(
+        &mut self,
+        writes: &[PageWrite],
+        appends: &[PageAppend],
+        durable: bool,
+    ) -> Result<(Vec<Lsn>, Vec<Lsn>)> {
+        let write_lsns = if writes.is_empty() {
+            Vec::new()
+        } else {
+            self.write_pages_inner(writes, false)?
+        };
+        let append_lsns = if appends.is_empty() {
+            Vec::new()
+        } else {
+            self.append_pages_inner(appends, false)?
+        };
+        if durable {
+            self.wal.sync()?;
+        }
+        Ok((write_lsns, append_lsns))
     }
 
     fn write_pages_inner(&mut self, writes: &[PageWrite], durable: bool) -> Result<Vec<Lsn>> {
@@ -599,6 +661,12 @@ impl DurableStore {
         // Entries leave the dirty table only after the sync, so a reader
         // always finds each page in the table or, once removed, in the
         // synced file; there is no torn-read window in between.
+        // Pages still open for appends are not in the queue, so hand them
+        // over before draining it; the log that protects them is about to
+        // be recycled.
+        for page_id in self.open_pages.drain().collect::<Vec<_>>() {
+            self.flush_queue.push_back(page_id);
+        }
         while self.flush_some_dirty(usize::MAX)? > 0 {}
         self.data.sync()?;
 
@@ -912,6 +980,7 @@ mod tests {
                         page_id: PageId(3),
                         offset: at,
                         payload: chunk.to_vec(),
+                        sealed: false,
                     }])
                     .expect("append");
                 at += chunk.len() as u32;
@@ -940,6 +1009,78 @@ mod tests {
     }
 
     #[test]
+    fn an_open_page_skips_the_flush_queue_but_a_checkpoint_still_saves_it() {
+        let directory = tempdir().expect("tempdir");
+        {
+            let mut store =
+                DurableStore::open(directory.path(), StoreOptions::default()).expect("open");
+            store
+                .append_pages([PageAppend {
+                    page_id: PageId(4),
+                    offset: 0,
+                    payload: b"still filling".to_vec(),
+                    sealed: false,
+                }])
+                .expect("append");
+            // Nothing to flush: rewriting the page per record is exactly the
+            // cost packing exists to avoid.
+            assert_eq!(store.flush_some_dirty(16).expect("flush"), 0);
+
+            // The checkpoint recycles the log, so it has to take the page.
+            store.checkpoint().expect("checkpoint");
+        }
+
+        let mut reopened =
+            DurableStore::open(directory.path(), StoreOptions::default()).expect("reopen");
+        assert_eq!(
+            reopened
+                .read_page(PageId(4))
+                .expect("read")
+                .expect("page survived")
+                .payload(),
+            b"still filling"
+        );
+    }
+
+    #[test]
+    fn sealing_a_page_hands_it_to_the_flush_queue() {
+        let directory = tempdir().expect("tempdir");
+        let mut store =
+            DurableStore::open(directory.path(), StoreOptions::default()).expect("open");
+        store
+            .append_pages([PageAppend {
+                page_id: PageId(6),
+                offset: 0,
+                payload: b"first".to_vec(),
+                sealed: false,
+            }])
+            .expect("append");
+        assert_eq!(store.flush_some_dirty(16).expect("flush"), 0);
+
+        store
+            .append_pages([PageAppend {
+                page_id: PageId(6),
+                offset: 5,
+                payload: b"last".to_vec(),
+                sealed: true,
+            }])
+            .expect("seal");
+        assert_eq!(
+            store.flush_some_dirty(16).expect("flush"),
+            1,
+            "one write for the whole filled page"
+        );
+        assert_eq!(
+            store
+                .read_page(PageId(6))
+                .expect("read")
+                .expect("page")
+                .payload(),
+            b"firstlast"
+        );
+    }
+
+    #[test]
     fn appends_that_reach_the_log_out_of_order_still_land_correctly() {
         let directory = tempdir().expect("tempdir");
         {
@@ -949,15 +1090,17 @@ mod tests {
             store
                 .append_pages([PageAppend {
                     page_id: PageId(5),
-                    offset: 4,
-                    payload: b"second".to_vec(),
+                    offset: 10,
+                    payload: b"third".to_vec(),
+                    sealed: false,
                 }])
                 .expect("append tail first");
             store
                 .append_pages([PageAppend {
                     page_id: PageId(5),
                     offset: 0,
-                    payload: b"1st/".to_vec(),
+                    payload: b"1st/second".to_vec(),
+                    sealed: false,
                 }])
                 .expect("append head second");
         }
@@ -970,7 +1113,7 @@ mod tests {
                 .expect("read")
                 .expect("page")
                 .payload(),
-            b"1st/second",
+            b"1st/secondthird",
             "each record replays at its own offset regardless of log order"
         );
     }
@@ -986,6 +1129,7 @@ mod tests {
                     page_id: PageId(1),
                     offset: 0,
                     payload: b"before/".to_vec(),
+                    sealed: false,
                 }])
                 .expect("append");
             // The checkpoint puts the page in the data file and empties the
@@ -996,6 +1140,7 @@ mod tests {
                     page_id: PageId(1),
                     offset: b"before/".len() as u32,
                     payload: b"after".to_vec(),
+                    sealed: false,
                 }])
                 .expect("append after checkpoint");
         }
@@ -1023,16 +1168,19 @@ mod tests {
                     page_id: PageId(2),
                     offset: 0,
                     payload: b"a".to_vec(),
+                    sealed: false,
                 },
                 PageAppend {
                     page_id: PageId(7),
                     offset: 0,
                     payload: b"x".to_vec(),
+                    sealed: false,
                 },
                 PageAppend {
                     page_id: PageId(2),
                     offset: 1,
                     payload: b"b".to_vec(),
+                    sealed: false,
                 },
             ])
             .expect("append batch");
@@ -1064,6 +1212,7 @@ mod tests {
                 page_id: PageId(1),
                 offset: 0,
                 payload: vec![b'k'; 64],
+                sealed: false,
             }])
             .expect("first append");
         let log_before = store.wal_size_bytes().expect("size");
@@ -1073,6 +1222,7 @@ mod tests {
                 page_id: PageId(1),
                 offset: 64,
                 payload: vec![b'z'; crate::MAX_PAGE_PAYLOAD],
+                sealed: false,
             }]),
             Err(StorageError::PageTooLarge { .. })
         ));
