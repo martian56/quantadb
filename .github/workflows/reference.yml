@@ -1,0 +1,82 @@
+name: Reference
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  field:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: linux-x64-full
+            runner: ubuntu-latest
+            cpus: "0"
+          - profile: linux-x64-2cpu-2gb
+            runner: ubuntu-latest
+            cpus: "2"
+            memory: 2g
+          - profile: linux-x64-1cpu-1gb
+            runner: ubuntu-latest
+            cpus: "1"
+            memory: 1g
+          - profile: linux-arm64-full
+            runner: ubuntu-24.04-arm
+            cpus: "0"
+    name: Field ${{ matrix.profile }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install psycopg2-binary pymysql
+      - name: Build QuantaDB image
+        run: docker build -q -t quantadb:ref .
+      - name: Bench the field
+        shell: bash
+        run: |
+          limits=""
+          if [ "${{ matrix.cpus }}" != "0" ]; then
+            limits="--cpus ${{ matrix.cpus }} --memory ${{ matrix.memory }}"
+          fi
+
+          wait_ready() {
+            for _ in $(seq 1 180); do
+              if python .github/scripts/field_bench.py --probe "$2" "$3" 2>/dev/null; then
+                return 0
+              fi
+              sleep 1
+            done
+            echo "$1 never came up"
+            docker logs fielddb || true
+            return 1
+          }
+
+          run_engine() {
+            engine=$1 driver=$2 port=$3
+            shift 3
+            docker run -d --name fielddb $limits "$@" >/dev/null
+            wait_ready "$engine" "$driver" "$port"
+            sleep 3
+            python .github/scripts/field_bench.py "$engine" "$driver" "$port" "${{ matrix.profile }}.jsonl"
+            docker rm -f fielddb >/dev/null
+            sleep 2
+          }
+
+          run_engine quantadb quantadb 55432 \
+            -p 55432:55432 quantadb:ref
+          run_engine postgres18 postgres 5433 \
+            -e POSTGRES_PASSWORD=bench -p 5433:5432 postgres:18
+          run_engine mysql84 mysql 3307 \
+            -e MYSQL_ROOT_PASSWORD=bench -e MYSQL_DATABASE=bench -p 3307:3306 mysql:8.4
+          run_engine mariadb114 mysql 3307 \
+            -e MYSQL_ROOT_PASSWORD=bench -e MYSQL_DATABASE=bench -p 3307:3306 mariadb:11.4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reference-${{ matrix.profile }}
+          path: ${{ matrix.profile }}.jsonl
+          if-no-files-found: error
