@@ -37,28 +37,28 @@ on the same runners with one shared driver. The tables below are rewritten
 by CI from the newest run on main, so they are current, not curated.
 
 <!-- bench:start -->
-Measured on main at `5af8eaf4c`.
+Measured on main at `ba0ec3947`.
 
 QuantaDB on GitHub runners, loadgen native protocol, 10 seconds per
 workload at 4 connections:
 
 | profile | reads ops/s | mixed ops/s | writes ops/s | write p99 ms |
 |---|---:|---:|---:|---:|
-| linux-arm64-full | 30908 | 13965 | 4110 | 11.2 |
-| linux-x64-1cpu-1gb | 16279 | 8992 | 4758 | 4.6 |
-| linux-x64-2cpu-2gb | 17316 | 11312 | 4826 | 3.4 |
-| linux-x64-full | 24586 | 13643 | 4961 | 4.5 |
-| windows-x64-full | 22712 | 7162 | 656 | 16.3 |
+| linux-arm64-full | 30250 | 14507 | 5436 | 9.6 |
+| linux-x64-1cpu-1gb | 13146 | 7610 | 4124 | 11.4 |
+| linux-x64-2cpu-2gb | 23454 | 15050 | 7436 | 1.3 |
+| linux-x64-full | 23793 | 13731 | 5548 | 4.1 |
+| windows-x64-full | 21955 | 6018 | 883 | 16.1 |
 
 The field at 2 CPUs and 2 GiB, identical containers, one shared
 driver through each engine's Postgres or MySQL port, measured 2026-07-24:
 
 | engine | reads ops/s | mixed ops/s | writes ops/s |
 |---|---:|---:|---:|
-| **quantadb** | 32215 | 13871 | 3036 |
-| postgres18 | 33941 | 23876 | 10318 |
-| mariadb114 | 6070 | 5428 | 4957 |
-| mysql84 | 6279 | 5030 | 3738 |
+| **quantadb** | 17885 | 14681 | 7509 |
+| postgres18 | 15087 | 14706 | 10447 |
+| mariadb114 | 3393 | 3650 | 5990 |
+| mysql84 | 3381 | 3505 | 2866 |
 
 MySQL and MariaDB read throughput is limited by the pure Python client in the shared driver; their write numbers are server bound.
 <!-- bench:end -->
