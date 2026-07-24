@@ -545,6 +545,48 @@ impl DurableStore {
         Ok(lsns)
     }
 
+    /// Log page replacements and page appends together under one sync.
+    ///
+    /// Each kind still forms its own batch in the log, so a crash keeps or
+    /// drops each as a unit; the single sync is what they share.
+    pub fn apply_batch(
+        &mut self,
+        writes: &[PageWrite],
+        appends: &[PageAppend],
+        durable: bool,
+    ) -> Result<(Vec<Lsn>, Vec<Lsn>)> {
+        if self.poisoned {
+            return Err(StorageError::Poisoned);
+        }
+        let result = self.apply_batch_inner(writes, appends, durable);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn apply_batch_inner(
+        &mut self,
+        writes: &[PageWrite],
+        appends: &[PageAppend],
+        durable: bool,
+    ) -> Result<(Vec<Lsn>, Vec<Lsn>)> {
+        let write_lsns = if writes.is_empty() {
+            Vec::new()
+        } else {
+            self.write_pages_inner(writes, false)?
+        };
+        let append_lsns = if appends.is_empty() {
+            Vec::new()
+        } else {
+            self.append_pages_inner(appends, false)?
+        };
+        if durable {
+            self.wal.sync()?;
+        }
+        Ok((write_lsns, append_lsns))
+    }
+
     fn write_pages_inner(&mut self, writes: &[PageWrite], durable: bool) -> Result<Vec<Lsn>> {
         let mut lsns = Vec::with_capacity(writes.len());
         for write in writes {
