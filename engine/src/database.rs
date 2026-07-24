@@ -10,7 +10,7 @@ use crate::{
     schema::IndexSchema,
     EngineError, OutputColumn, Result, StatementOutput, TableSchema, TransactionOutput, Value,
 };
-use quantadb_mvcc::{MvccDatabase, MvccOptions, Transaction};
+use quantadb_mvcc::{MvccDatabase, MvccOptions, Transaction, TransactionError};
 use quantadb_syntax::{parse_sql, Delete, Expr, Insert, Select, SelectItem, Statement, Update};
 use std::{collections::HashSet, mem, path::Path, sync::Arc};
 
@@ -143,12 +143,7 @@ impl SqlSession {
 
     fn execute_data_statement(&mut self, statement: Statement) -> Result<StatementOutput> {
         match mem::replace(&mut self.state, SessionState::Idle) {
-            SessionState::Idle => {
-                let mut transaction = self.engine.database.begin()?;
-                let output = execute_in_transaction(&mut transaction, statement)?;
-                transaction.commit()?;
-                Ok(output)
-            }
+            SessionState::Idle => self.execute_autocommit(statement),
             SessionState::Active(mut transaction) => {
                 match execute_in_transaction(&mut transaction, statement) {
                     Ok(output) => {
@@ -168,6 +163,50 @@ impl SqlSession {
             }
         }
     }
+
+    /// An autocommit statement that loses a conflict race is re-run on a
+    /// fresh snapshot, which is per statement read committed behavior.
+    /// Explicit transactions still surface the conflict to the caller,
+    /// because only the caller can re-run its earlier statements.
+    fn execute_autocommit(&mut self, statement: Statement) -> Result<StatementOutput> {
+        const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+        let started = std::time::Instant::now();
+        let mut attempt = 0;
+        loop {
+            let mut transaction = self.engine.database.begin()?;
+            let result = match execute_in_transaction(&mut transaction, statement.clone()) {
+                Ok(output) => transaction.commit().map(|_| output).map_err(Into::into),
+                Err(error) => {
+                    drop(transaction);
+                    Err(error)
+                }
+            };
+            match result {
+                Err(ref error) if is_conflict(error) && started.elapsed() < RETRY_BUDGET => {
+                    attempt += 1;
+                    conflict_backoff(attempt);
+                }
+                other => return other,
+            }
+        }
+    }
+}
+
+fn is_conflict(error: &EngineError) -> bool {
+    matches!(
+        error,
+        EngineError::Transaction(
+            TransactionError::WriteConflict { .. } | TransactionError::RangeConflict { .. }
+        )
+    )
+}
+
+fn conflict_backoff(attempt: u32) {
+    let step = 50_u64 << attempt.min(6);
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos() as u64 % step);
+    std::thread::sleep(std::time::Duration::from_micros(step + jitter));
 }
 
 fn execute_in_transaction(
@@ -851,6 +890,74 @@ mod tests {
             StatementOutput::Query { rows, .. } => rows,
             other => panic!("expected a query result, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn autocommit_updates_on_one_hot_key_never_surface_conflicts() {
+        let directory = tempdir().expect("tempdir");
+        let engine =
+            DatabaseEngine::open(directory.path(), MvccOptions::default()).expect("engine");
+        let mut session = engine.session();
+        session
+            .execute("CREATE TABLE hot (id BIGINT PRIMARY KEY, val BIGINT)")
+            .expect("create table");
+        session
+            .execute("INSERT INTO hot (id, val) VALUES (1, 0)")
+            .expect("seed");
+
+        let mut threads = Vec::new();
+        for worker in 0..4_u64 {
+            let engine = engine.clone();
+            threads.push(std::thread::spawn(move || {
+                let mut session = engine.session();
+                for round in 0..25_u64 {
+                    session
+                        .execute(&format!(
+                            "UPDATE hot SET val = {} WHERE id = 1",
+                            worker * 100 + round
+                        ))
+                        .expect("autocommit update retries conflicts away");
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().expect("worker");
+        }
+
+        let rows = query_rows(&mut session, "SELECT val FROM hot WHERE id = 1");
+        assert_eq!(rows.len(), 1, "one row, updated a hundred times");
+    }
+
+    #[test]
+    fn explicit_transactions_still_surface_write_conflicts() {
+        let directory = tempdir().expect("tempdir");
+        let engine =
+            DatabaseEngine::open(directory.path(), MvccOptions::default()).expect("engine");
+        let mut setup = engine.session();
+        setup
+            .execute("CREATE TABLE contested (id BIGINT PRIMARY KEY, val BIGINT)")
+            .expect("create table");
+        setup
+            .execute("INSERT INTO contested (id, val) VALUES (1, 0)")
+            .expect("seed");
+
+        let mut first = engine.session();
+        let mut second = engine.session();
+        first.execute("BEGIN").expect("begin first");
+        second.execute("BEGIN").expect("begin second");
+        first
+            .execute("UPDATE contested SET val = 1 WHERE id = 1")
+            .expect("first write");
+        second
+            .execute("UPDATE contested SET val = 2 WHERE id = 1")
+            .expect("second write is invisible until commit");
+        first.execute("COMMIT").expect("first commit wins");
+        assert!(matches!(
+            second.execute("COMMIT"),
+            Err(EngineError::Transaction(
+                TransactionError::WriteConflict { .. }
+            ))
+        ));
     }
 
     #[test]
