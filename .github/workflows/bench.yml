@@ -43,6 +43,8 @@ jobs:
           path: |
             target/release/quantadb-server*
             target/release/loadgen*
+            !target/release/*.d
+            !target/release/*.pdb
           if-no-files-found: error
 
   bench:
@@ -101,10 +103,11 @@ jobs:
               -v "$PWD/bin:/app:ro" \
               ubuntu:24.04 /app/quantadb-server
           else
+            server=$(ls bin/quantadb-server bin/quantadb-server.exe 2>/dev/null | head -1)
             QUANTA_DATA_DIR="$RUNNER_TEMP/qdata" \
             QUANTA_PG_LISTEN_ADDRESS=off \
             QUANTA_HTTP_LISTEN_ADDRESS=off \
-            ./bin/quantadb-server* &
+            "$server" &
           fi
           for _ in $(seq 1 60); do
             if (exec 3<>/dev/tcp/127.0.0.1/54321) 2>/dev/null; then
@@ -119,7 +122,7 @@ jobs:
       - name: Run workloads
         shell: bash
         run: |
-          loadgen=$(ls bin/loadgen*)
+          loadgen=$(ls bin/loadgen bin/loadgen.exe 2>/dev/null | head -1)
           run_pass() {
             "$loadgen" --seconds 10 --connections 4 --rows 5000 --read-percent "$2" > pass.txt
             cat pass.txt
