@@ -2,13 +2,13 @@
   <title>QuantaDB</title>
   <defs>
     <linearGradient id="quanta" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#45c8d8"/>
-      <stop offset="1" stop-color="#8f7dff"/>
+      <stop offset="0" stop-color="#855bfb"/>
+      <stop offset="1" stop-color="#5b1ecf"/>
     </linearGradient>
   </defs>
-  <rect width="64" height="64" rx="14" fill="#10151d"/>
-  <rect x="14" y="40" width="36" height="7" rx="3.5" fill="url(#quanta)" opacity=".55"/>
-  <rect x="14" y="29" width="36" height="7" rx="3.5" fill="url(#quanta)" opacity=".80"/>
-  <rect x="14" y="18" width="24" height="7" rx="3.5" fill="url(#quanta)"/>
-  <rect x="43" y="18" width="7" height="7" rx="3.5" fill="#45c8d8"/>
+  <rect width="64" height="64" rx="14" fill="#7132f5"/>
+  <rect x="14" y="40" width="36" height="7" rx="3.5" fill="#ffffff" opacity=".45"/>
+  <rect x="14" y="29" width="36" height="7" rx="3.5" fill="#ffffff" opacity=".72"/>
+  <rect x="14" y="18" width="24" height="7" rx="3.5" fill="#ffffff"/>
+  <rect x="43" y="18" width="7" height="7" rx="3.5" fill="#ffffff"/>
 </svg>

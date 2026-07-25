@@ -3,15 +3,15 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>QuantaDB</title>
-<meta name="description" content="QuantaDB is an experimental OLTP database in Rust: checksummed pages, a physical write-ahead log, MVCC snapshots, and benchmarks published with the hardware they ran on.">
+<title>QuantaDB — an OLTP database measured in the open</title>
+<meta name="description" content="QuantaDB is an open source OLTP database in Rust. Every benchmark names its hardware, runs against PostgreSQL, MySQL and MariaDB, and is published whether it wins or loses.">
 <link rel="icon" href="favicon.ico" sizes="any">
 <link rel="icon" href="logo.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
 <link rel="manifest" href="site.webmanifest">
-<meta name="theme-color" content="#10151d">
+<meta name="theme-color" content="#ffffff">
 <meta property="og:title" content="QuantaDB">
-<meta property="og:description" content="An experimental OLTP database in Rust: checksummed pages, a physical write-ahead log, MVCC snapshots, and benchmarks published with the hardware they ran on.">
+<meta property="og:description" content="An open source OLTP database in Rust, measured against PostgreSQL, MySQL and MariaDB on every pull request.">
 <meta property="og:type" content="website">
 <meta property="og:image" content="icon-512.png">
 <meta name="twitter:card" content="summary">
@@ -19,287 +19,186 @@
 </head>
 <body>
 
-<header class="masthead">
-  <div class="masthead-inner">
-    <a class="wordmark" href="#top"><img class="wordmark-mark" src="logo.svg" width="22" height="22" alt=""> QuantaDB</a>
-    <span class="version">v0.2.0, experimental</span>
-    <nav class="masthead-nav">
-      <a href="#formats">Formats</a>
-      <a href="#architecture">Architecture</a>
-      <a href="#measured">Numbers</a>
-      <a href="#protocol">Protocol</a>
+<nav class="nav">
+  <div class="wrap nav-inner">
+    <a class="brand" href="#top">
+      <img src="logo.svg" width="26" height="26" alt=""> QuantaDB
+    </a>
+    <div class="nav-links">
+      <a href="#why">Why</a>
+      <a href="#numbers">Benchmarks</a>
+      <a href="#start">Get started</a>
       <a href="#status">Status</a>
-      <a class="repo-link" href="https://github.com/martian56/quantadb">Source</a>
-    </nav>
+      <a href="https://github.com/martian56/quantadb">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero" id="top">
+  <div class="wrap">
+    <div class="hero-inner">
+    <h1>An OLTP database, measured in the open.</h1>
+    <p>
+      QuantaDB is a storage engine written in Rust and spoken to over the
+      PostgreSQL wire protocol. Every benchmark names the machine it ran on,
+      runs beside PostgreSQL, MySQL and MariaDB, and gets published whether it
+      wins or loses.
+    </p>
+    <div class="hero-actions">
+      <a class="btn btn-primary" href="#start">Get started</a>
+      <a class="btn btn-outline" href="https://github.com/martian56/quantadb">View on GitHub</a>
+    </div>
+    </div>
+  </div>
+
+  <div class="wrap">
+    <div class="metrics">
+      <div class="metric"><b>22,528</b><span>Reads per second, ahead of PostgreSQL</span></div>
+      <div class="metric"><b>&lt;1 ms</b><span>Read latency at the 99th percentile</span></div>
+      <div class="metric"><b>5</b><span>Machine profiles benched per change</span></div>
+      <div class="metric"><b>Apache-2.0</b><span>Open source, no paid tier</span></div>
+    </div>
   </div>
 </header>
 
-<main id="top">
-
-<section class="hero">
-  <div class="hero-copy">
-    <p class="eyebrow">A durable OLTP engine, written in Rust</p>
-    <h1>A database that shows its <span class="key">work</span>.</h1>
-    <p class="lede">
-      Every page is checksummed. Every commit waits for the log. Every
-      benchmark names the machine it ran on, and a result is thrown out if a
-      single correctness test fails. QuantaDB is being built the slow way:
-      storage first, proofs before promises.
-    </p>
-    <div class="hero-actions">
-      <a class="button" href="https://github.com/martian56/quantadb">Read the source</a>
-      <a class="button quiet" href="https://github.com/martian56/quantadb/tree/main/docs">Read the formats</a>
-    </div>
-  </div>
-
-  <figure class="page-artifact" aria-label="Annotated dump of a QuantaDB data page">
-    <figcaption>
-      <span class="mono-label">data page 42, byte for byte</span>
-    </figcaption>
-    <div class="hexdump" id="hexdump">
-      <div class="hexrow">
-        <span class="offset">0000</span>
-        <span class="bytes">51 4E 50 47</span>
-        <span class="note"><i class="line sp-storage"></i>magic "QNPG": this is a page</span>
-      </div>
-      <div class="hexrow">
-        <span class="offset">0004</span>
-        <span class="bytes">01 00&nbsp;&nbsp;00 00</span>
-        <span class="note">format v1, reserved</span>
-      </div>
-      <div class="hexrow">
-        <span class="offset">0008</span>
-        <span class="bytes">2A 00 00 00 00 00 00 00</span>
-        <span class="note">page ID 42, little endian</span>
-      </div>
-      <div class="hexrow">
-        <span class="offset">0010</span>
-        <span class="bytes">C4 01 00 00 00 00 00 00</span>
-        <span class="note">last applied log sequence number</span>
-      </div>
-      <div class="hexrow">
-        <span class="offset">0018</span>
-        <span class="bytes">9A 00 00 00</span>
-        <span class="note">payload length, 154 bytes</span>
-      </div>
-      <div class="hexrow">
-        <span class="offset">001C</span>
-        <span class="bytes">7B 3D 91 C8</span>
-        <span class="note">CRC32 over the whole page</span>
-      </div>
-      <div class="hexrow dim">
-        <span class="offset">0020</span>
-        <span class="bytes">00 00 00 00 &hellip;</span>
-        <span class="note">32 reserved bytes</span>
-      </div>
-      <div class="hexrow">
-        <span class="offset">0040</span>
-        <span class="bytes">51 4E 4D 56 01 00 00 00</span>
-        <span class="note"><i class="line sp-mvcc"></i>payload: an MVCC version record, "QNMV"</span>
-      </div>
-      <div class="hexrow">
-        <span class="offset">0048</span>
-        <span class="bytes">1D 00 00 00 00 00 00 00</span>
-        <span class="note">committed at timestamp 29</span>
-      </div>
-      <div class="hexrow dim">
-        <span class="offset">0050</span>
-        <span class="bytes">&hellip;</span>
-        <span class="note">key, value, zero padding to 8192</span>
-      </div>
-    </div>
-    <p class="artifact-footnote">
-      A page is never written before its log record and batch commit are on
-      disk. Recovery replays complete batches only, so a crash exposes all of
-      a commit or none of it.
-    </p>
-  </figure>
-</section>
-
-<section class="band" id="formats">
-  <header class="band-head">
-    <p class="eyebrow">On disk</p>
-    <h2>Five magics, one rule: versioned, checksummed, documented.</h2>
-    <p class="band-lede">
-      Everything QuantaDB persists starts with four bytes that say what it is
-      and a version that says how to read it. Readers verify before trusting.
-      The formats are documented in the repository down to the byte, because a
-      storage engine you cannot audit is a storage engine you cannot trust.
-    </p>
-  </header>
-  <ul class="spectrum" role="list">
-    <li><i class="line sp-storage"></i><code>QNPG</code><span class="spectrum-what">data page</span><span class="spectrum-note">8192 bytes, CRC32, identity checked on every read</span></li>
-    <li><i class="line sp-wal"></i><code>QNWL</code><span class="spectrum-what">log record</span><span class="spectrum-note">physical page image, batch commit, or checkpoint</span></li>
-    <li><i class="line sp-mvcc"></i><code>QNMV</code><span class="spectrum-what">version record</span><span class="spectrum-note">key, optional value, commit timestamp</span></li>
-    <li><i class="line sp-index"></i><code>QNIX</code><span class="spectrum-what">index node</span><span class="spectrum-note">immutable B+ tree leaf or internal node</span></li>
-    <li><i class="line sp-engine"></i><code>QNIR</code><span class="spectrum-what">index root</span><span class="spectrum-note">48 byte manifest publishing one generation</span></li>
-  </ul>
-</section>
-
-<section class="band" id="architecture">
-  <header class="band-head">
-    <p class="eyebrow">Architecture</p>
-    <h2>Six crates, one direction.</h2>
-    <p class="band-lede">
-      The dependency graph is acyclic and enforced: parsing knows nothing of
-      storage, the server delegates everything to the engine, and the network
-      threads never touch a disk. Each layer is testable, and tested, alone.
-    </p>
-  </header>
-  <ul class="stack" role="list">
-    <li>
-      <i class="line sp-neutral"></i>
-      <div><h3><code>syntax</code></h3>
-      <p>A dependency-light SQL lexer and parser. Every token carries a byte
-      span, so an error can point at the exact character that caused it.</p></div>
-    </li>
-    <li>
-      <i class="line sp-storage"></i>
-      <div><h3><code>storage</code></h3>
-      <p>Checksummed pages, a physical write-ahead log, restart recovery, and
-      a group commit coordinator that lets concurrent writers share syncs.</p></div>
-    </li>
-    <li>
-      <i class="line sp-index"></i>
-      <div><h3><code>index</code></h3>
-      <p>Immutable B+ tree generations. Readers traverse without locks while
-      the next generation is built beside them, never on top of them.</p></div>
-    </li>
-    <li>
-      <i class="line sp-mvcc"></i>
-      <div><h3><code>mvcc</code></h3>
-      <p>Snapshot isolation with first-committer-wins conflicts. Versions
-      become visible only after the log says they are durable. Old versions
-      are reclaimed the moment no snapshot can see them.</p></div>
-    </li>
-    <li>
-      <i class="line sp-engine"></i>
-      <div><h3><code>engine</code></h3>
-      <p>The relational layer: schemas, constraints, typed expressions, and
-      transactional CRUD mapped onto ordered binary keys.</p></div>
-    </li>
-    <li>
-      <i class="line sp-server"></i>
-      <div><h3><code>server</code></h3>
-      <p>A TCP server bounded on every axis: connections, in-flight requests,
-      frame size, idle time. Overload gets a clean error, not a hung socket.</p></div>
-    </li>
-  </ul>
-</section>
-
-<section class="band" id="measured">
-  <header class="band-head">
-    <p class="eyebrow">Measured, not promised</p>
-    <h2>The benchmark log is part of the changelog.</h2>
-    <p class="band-lede">
-      These are medians from the development machine: a Core i5-1035G1 laptop
-      with a consumer NVMe drive, full sync on every commit. Not a marketing
-      rig. When a change regresses a number, the number gets published anyway
-      and the regression gets fixed next.
-    </p>
-  </header>
-  <div class="figures">
-    <table class="figures-table">
-      <caption class="mono-label">criterion medians, 2026-07-23</caption>
-      <tbody>
-        <tr><th scope="row">hot indexed point lookup</th><td>705 ns</td></tr>
-        <tr><th scope="row">in-memory snapshot read</th><td>583 ns</td></tr>
-        <tr><th scope="row">parse a point select</th><td>2.8 &micro;s</td></tr>
-        <tr><th scope="row">B+ tree range scan, 100 keys</th><td>13.3 &micro;s</td></tr>
-        <tr><th scope="row">durable single-key commit</th><td>16.1 ms, the disk's fsync</td></tr>
-      </tbody>
-    </table>
-    <div class="figures-story">
-      <p class="mono-label">one workload, one week</p>
-      <p class="story-number"><span>736</span> to <span>2607</span> ops/s</p>
+<section class="band" id="why">
+  <div class="wrap">
+    <div class="band-head">
+      <p class="eyebrow">Why it exists</p>
+      <h2>Most database benchmarks are marketing. These are not.</h2>
       <p>
-        The same mixed workload, before and after a node cache, online index
-        publication, version reclamation, and a record cache. The read tail
-        fell from 139 ms worst case to 18.5 ms. One intermediate change made
-        reads worse; the benchmark caught it before main did.
+        Performance claims usually arrive without the hardware, the
+        competitors, or the runs that went badly. QuantaDB publishes all
+        three, because a number you cannot reproduce is not a number.
       </p>
     </div>
+    <div class="cards">
+      <div class="card">
+        <h3>Durable by default</h3>
+        <p>
+          A commit returns once its record is on disk. Pages carry checksums,
+          the log is replayed on restart, and corruption is detected rather
+          than assumed away. There is no faster mode that quietly drops this.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Readers never wait for writers</h3>
+        <p>
+          Snapshot isolation with multi-version reads. A query sees a
+          consistent moment in time and takes no locks, so a long read cannot
+          be blocked by a slow commit.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Speaks PostgreSQL</h3>
+        <p>
+          Connect with psql, psycopg, or any Postgres driver you already use.
+          There is a native protocol and a browser client too, but nothing
+          forces you onto them.
+        </p>
+      </div>
+    </div>
   </div>
 </section>
 
-<section class="band" id="protocol">
-  <header class="band-head">
-    <p class="eyebrow">Protocol v1</p>
-    <h2>One JSON frame per line. Deliberately boring.</h2>
-    <p class="band-lede">
-      The current wire protocol is built for debugging a young database: you
-      can drive it with a terminal and read every byte. PostgreSQL wire
-      compatibility is on the roadmap; this is the scaffolding that gets us
-      there honestly.
+<section class="band band-soft" id="numbers">
+  <div class="wrap">
+    <div class="band-head">
+      <p class="eyebrow">Benchmarks</p>
+      <h2>Four engines, identical containers, one driver.</h2>
+      <p>
+        Each database runs alone at 2 CPUs and 2 GiB with default durability,
+        driven by the same client over the same protocol. Operations per
+        second, higher is better.
+      </p>
+    </div>
+
+    <div class="table-shell">
+      <table>
+        <thead>
+          <tr><th>Engine</th><th>Reads</th><th>Mixed 80/20</th><th>Writes</th></tr>
+        </thead>
+        <tbody>
+          <tr class="us"><td>QuantaDB</td><td><span class="win">22,528</span></td><td>16,774</td><td>8,374</td></tr>
+          <tr><td>PostgreSQL 18</td><td>17,060</td><td>17,006</td><td><span class="win">11,404</span></td></tr>
+          <tr><td>MariaDB 11.4</td><td>3,735</td><td>4,006</td><td>6,741</td></tr>
+          <tr><td>MySQL 8.4</td><td>3,804</td><td>3,845</td><td>4,847</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">
+      QuantaDB leads on reads and ties on mixed. PostgreSQL still leads on
+      writes, and the gap is tracked in the open. Read throughput for MySQL and
+      MariaDB is limited by the shared Python driver; their write numbers are
+      server bound.
     </p>
-  </header>
-  <div class="terminal" role="img" aria-label="A protocol session: create table, insert, select">
-    <p><span class="prompt">&rarr;</span> {"protocol_version":1,"request_id":1,"request":{"type":"execute","sql":"CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance DOUBLE NOT NULL)"}}</p>
-    <p><span class="prompt reply">&larr;</span> {"protocol_version":1,"request_id":1,"response":{"type":"executed","results":[{"type":"command","tag":"CREATE TABLE","affected_rows":0}]}}</p>
-    <p><span class="prompt">&rarr;</span> {"protocol_version":1,"request_id":2,"request":{"type":"execute","sql":"INSERT INTO accounts (id, balance) VALUES (1, 250.0)"}}</p>
-    <p><span class="prompt reply">&larr;</span> {"protocol_version":1,"request_id":2,"response":{"type":"executed","results":[{"type":"command","tag":"INSERT","affected_rows":1}]}}</p>
-    <p><span class="prompt">&rarr;</span> {"protocol_version":1,"request_id":3,"request":{"type":"execute","sql":"SELECT id, balance FROM accounts WHERE id = 1"}}</p>
-    <p><span class="prompt reply">&larr;</span> {"protocol_version":1,"request_id":3,"response":{"type":"executed","results":[{"type":"query","columns":[{"name":"id","data_type":"int64","nullable":false},{"name":"balance","data_type":"float64","nullable":false}],"rows":[[{"type":"integer","value":1},{"type":"float","value":250.0}]]}]}}</p>
+  </div>
+</section>
+
+<section class="band" id="start">
+  <div class="wrap">
+    <div class="band-head">
+      <p class="eyebrow">Get started</p>
+      <h2>Running in about a minute.</h2>
+      <p>Start the server, then connect with the Postgres client you already have.</p>
+    </div>
+    <pre class="code"><span class="c"># start a server</span>
+<span class="k">docker</span> run -p 55432:55432 ghcr.io/martian56/quantadb
+
+<span class="c"># connect with psql</span>
+<span class="k">psql</span> "host=127.0.0.1 port=55432 user=quanta dbname=quanta"
+
+<span class="k">CREATE TABLE</span> notes (id BIGINT PRIMARY KEY, body TEXT NOT NULL);
+<span class="k">INSERT INTO</span> notes VALUES (1, 'durable on return');
+<span class="k">SELECT</span> * <span class="k">FROM</span> notes;</pre>
   </div>
 </section>
 
 <section class="band" id="status">
-  <header class="band-head">
-    <p class="eyebrow">Status</p>
-    <h2>Do not store data you love in this. Yet.</h2>
-    <p class="band-lede">
-      QuantaDB is a working engine and an honest work in progress. The v0.1
-      prototype was retired; the current codebase is a clean foundation with
-      real durability guarantees and a long road ahead. Milestones are
-      numbered because they are a sequence: each one is load-bearing for the
-      next.
-    </p>
-  </header>
-  <ol class="milestones" role="list">
-    <li class="done"><span class="m">M1</span><div><h3>Syntax and server foundation</h3><p>Span-aware parser, versioned protocol, bounded connections.</p></div></li>
-    <li class="done"><span class="m">M2</span><div><h3>Durable storage kernel</h3><p>Pages, WAL, group commit, crash recovery, corruption detection.</p></div></li>
-    <li class="active"><span class="m">M3</span><div><h3>Transactions and indexes</h3><p>MVCC, online index generations, reclamation, and a concurrent
-    history checker that has already caught two real bugs. Range conflict
-    tracking remains.</p></div></li>
-    <li><span class="m">M4</span><div><h3>Execution engine</h3><p>Planner, joins, ordering, secondary indexes, cost-based decisions.</p></div></li>
-    <li><span class="m">M5</span><div><h3>Production operations</h3><p>PostgreSQL wire protocol, auth, TLS, backup, format stability.</p></div></li>
-    <li><span class="m">M6</span><div><h3>Replication</h3><p>Replicated log, failover, and adversarial failure testing before any
-    talk of distribution.</p></div></li>
-  </ol>
+  <div class="wrap">
+    <div class="band-head">
+      <p class="eyebrow">Status</p>
+      <h2>Honest about where this is.</h2>
+      <p>
+        QuantaDB is experimental. It has no authentication and no replication,
+        and it is not where your production data should live yet.
+      </p>
+    </div>
+    <ul class="steps">
+      <li class="step done"><em>Done</em><div><b>Storage kernel</b><p>Checksummed pages, write-ahead log, group commit, crash recovery.</p></div></li>
+      <li class="step done"><em>Done</em><div><b>Transactions and indexes</b><p>MVCC snapshots, B+ tree indexes published online, version reclamation.</p></div></li>
+      <li class="step done"><em>Done</em><div><b>PostgreSQL wire protocol</b><p>Simple and extended queries, so existing drivers connect unmodified.</p></div></li>
+      <li class="step now"><em>Now</em><div><b>Write throughput</b><p>Closing the remaining gap to PostgreSQL on durable commits.</p></div></li>
+      <li class="step"><em>Next</em><div><b>Authentication, TLS, replication</b><p>The work that has to land before anyone stores something they care about.</p></div></li>
+    </ul>
+  </div>
 </section>
 
-</main>
+<section class="closer">
+  <div class="wrap">
+    <h2>Read the code, run the benchmarks.</h2>
+    <p>
+      Everything is Apache-2.0, including the harness that produced the numbers
+      on this page. Disagree with them and you can rerun them.
+    </p>
+    <div class="hero-actions">
+      <a class="btn btn-primary" href="https://github.com/martian56/quantadb">View on GitHub</a>
+      <a class="btn btn-outline" href="https://github.com/martian56/quantadb/tree/main/docs">Read the docs</a>
+    </div>
+  </div>
+</section>
 
-<footer class="footer">
-  <div class="footer-inner">
-    <svg class="squiggle" viewBox="0 0 1200 14" preserveAspectRatio="none" aria-hidden="true">
-      <path d="M0 7 Q 25 0 50 7 T 100 7 T 150 7 T 200 7 T 250 7 T 300 7 T 350 7 T 400 7 T 450 7 T 500 7 T 550 7 T 600 7 T 650 7 T 700 7 T 750 7 T 800 7 T 850 7 T 900 7 T 950 7 T 1000 7 T 1050 7 T 1100 7 T 1150 7 T 1200 7"/>
-    </svg>
-    <p>QuantaDB is MIT licensed and developed in the open.</p>
-    <nav>
+<footer class="foot">
+  <div class="wrap foot-inner">
+    <span>QuantaDB — Apache-2.0</span>
+    <div class="foot-links">
       <a href="https://github.com/martian56/quantadb">GitHub</a>
-      <a href="https://github.com/martian56/quantadb/tree/main/docs">Format documents</a>
-      <a href="https://github.com/martian56/quantadb/blob/main/docs/benchmarks.md">Benchmark method</a>
+      <a href="https://github.com/martian56/quantadb/tree/main/docs">Docs</a>
       <a href="https://github.com/martian56/quantadb/issues">Issues</a>
-    </nav>
+      <a href="https://github.com/martian56/quantadb/blob/main/CONTRIBUTING.md">Contributing</a>
+    </div>
   </div>
 </footer>
-
-<script>
-(function () {
-  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
-  var rows = document.querySelectorAll(".hexrow");
-  rows.forEach(function (row, index) {
-    row.style.opacity = "0";
-    row.style.transform = "translateY(4px)";
-    setTimeout(function () {
-      row.style.transition = "opacity 220ms ease, transform 220ms ease";
-      row.style.opacity = "1";
-      row.style.transform = "none";
-    }, 240 + index * 90);
-  });
-})();
-</script>
 
 </body>
 </html>
