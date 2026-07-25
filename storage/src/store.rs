@@ -90,6 +90,20 @@ struct AllocatorState {
 }
 
 impl PageAllocator {
+    /// Reserve one page, reporting whether it came off the free pool.
+    pub fn reserve_one(&self) -> Result<(PageId, bool)> {
+        let mut state = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        if let Some(reused) = state.free_pages.pop_first() {
+            return Ok((reused, true));
+        }
+        let page_id = PageId(state.next_page_id);
+        state.next_page_id = state
+            .next_page_id
+            .checked_add(1)
+            .ok_or_else(|| StorageError::Configuration("page ID space exhausted".to_owned()))?;
+        Ok((page_id, false))
+    }
+
     pub fn reserve(&self, count: usize) -> Result<Vec<PageId>> {
         let mut state = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
         let mut page_ids = Vec::with_capacity(count);

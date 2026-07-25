@@ -290,6 +290,11 @@ impl GroupCommitHandle {
         self.allocator.reserve(count)
     }
 
+    /// Reserve one page, reporting whether it came off the free pool.
+    pub fn reserve_one_page(&self) -> Result<(PageId, bool)> {
+        self.allocator.reserve_one()
+    }
+
     /// Return unreachable pages to the free pool.
     pub fn release_pages(&self, pages: impl IntoIterator<Item = PageId>) -> Result<()> {
         self.allocator.release(pages)
