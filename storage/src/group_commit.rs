@@ -3,8 +3,9 @@ use crate::{
     DurableStore, Lsn, Page, PageAppend, PageId, PageWrite, Result, StorageError, MAX_PAGE_PAYLOAD,
 };
 use std::{
+    fs::File,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
         Arc, Mutex,
     },
@@ -117,10 +118,19 @@ enum Command {
     Shutdown(SyncSender<()>),
 }
 
+type Reply = (SyncSender<Result<Vec<Lsn>>>, Result<Vec<Lsn>>);
+
+/// A batch that is in the log but not yet on disk.
+struct PendingSync {
+    file: File,
+    replies: Vec<Reply>,
+}
+
 pub struct GroupCommitter {
     handle: GroupCommitHandle,
     worker: Option<JoinHandle<()>>,
     checkpointer: Option<JoinHandle<()>>,
+    syncer: Option<JoinHandle<()>>,
 }
 
 #[derive(Clone)]
@@ -140,6 +150,12 @@ impl GroupCommitter {
         let stats = Arc::new(AtomicStats::default());
         let (sender, receiver) = mpsc::sync_channel(options.queue_depth);
         let (checkpoint_sender, checkpoint_receiver) = mpsc::sync_channel(1);
+        let (sync_sender, sync_receiver) = mpsc::channel::<PendingSync>();
+        let pending_syncs = Arc::new(AtomicUsize::new(0));
+        let syncer_pending = Arc::clone(&pending_syncs);
+        let syncer = thread::Builder::new()
+            .name("quantadb-log-sync".to_owned())
+            .spawn(move || sync_worker(sync_receiver, &syncer_pending))?;
         let checkpointer_store = Arc::clone(&store);
         let checkpointer_stats = Arc::clone(&stats);
         let checkpointer = thread::Builder::new()
@@ -158,6 +174,8 @@ impl GroupCommitter {
                     worker_stats,
                     options,
                     checkpoint_sender,
+                    sync_sender,
+                    &pending_syncs,
                 );
             })?;
 
@@ -170,6 +188,7 @@ impl GroupCommitter {
             },
             worker: Some(worker),
             checkpointer: Some(checkpointer),
+            syncer: Some(syncer),
         })
     }
 
@@ -197,6 +216,12 @@ impl GroupCommitter {
         worker
             .join()
             .map_err(|_| StorageError::GroupCommit("worker thread panicked".to_owned()))?;
+        // the worker's exit drops the only sync sender
+        if let Some(syncer) = self.syncer.take() {
+            syncer
+                .join()
+                .map_err(|_| StorageError::GroupCommit("sync thread panicked".to_owned()))?;
+        }
         // the worker's exit drops the only checkpoint sender
         if let Some(checkpointer) = self.checkpointer.take() {
             checkpointer
@@ -321,6 +346,8 @@ fn commit_worker(
     stats: Arc<AtomicStats>,
     options: GroupCommitOptions,
     checkpoint_sender: SyncSender<BackgroundCheckpoint>,
+    sync_sender: mpsc::Sender<PendingSync>,
+    pending_syncs: &AtomicUsize,
 ) {
     let mut pending = None;
     loop {
@@ -362,14 +389,28 @@ fn commit_worker(
                         Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
                     }
                 }
-                execute_group(&store, &stats, requests);
+                let durable = requests.iter().any(|request| request.durable);
+                if let Some(batch) = execute_group(&store, &stats, requests) {
+                    if durable {
+                        pending_syncs.fetch_add(1, Ordering::SeqCst);
+                        if sync_sender.send(batch).is_err() {
+                            pending_syncs.fetch_sub(1, Ordering::SeqCst);
+                        }
+                    } else {
+                        for (sender, result) in batch.replies {
+                            let _ = sender.send(result);
+                        }
+                    }
+                }
                 pace_flush(&store, &options);
-                maybe_checkpoint(&store, &stats, &options, &checkpoint_sender);
+                maybe_checkpoint(&store, &stats, &options, &checkpoint_sender, pending_syncs);
             }
             Command::Checkpoint(response) => {
+                await_syncs(pending_syncs);
                 let _ = response.send(explicit_checkpoint(&store));
             }
             Command::Shutdown(response) => {
+                await_syncs(pending_syncs);
                 let _ = response.send(());
                 return;
             }
@@ -386,15 +427,45 @@ fn pace_flush(store: &Mutex<DurableStore>, options: &GroupCommitOptions) {
     }
 }
 
+/// A checkpoint recycles segments, so nothing may still be waiting to sync one.
+fn await_syncs(pending: &AtomicUsize) {
+    while pending.load(Ordering::SeqCst) > 0 {
+        thread::yield_now();
+    }
+}
+
+fn sync_worker(receiver: Receiver<PendingSync>, pending: &AtomicUsize) {
+    while let Ok(first) = receiver.recv() {
+        let mut batch = vec![first];
+        while let Ok(next) = receiver.try_recv() {
+            batch.push(next);
+        }
+        // Checkpoints drain this queue before rotating, so one segment covers all.
+        let synced: std::io::Result<()> = batch.last().map_or(Ok(()), |item| item.file.sync_data());
+        for item in batch {
+            for (sender, result) in item.replies {
+                let reply = match &synced {
+                    Ok(()) => result,
+                    Err(_) => Err(StorageError::GroupCommit("log sync failed".to_owned())),
+                };
+                let _ = sender.send(reply);
+            }
+            pending.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
 fn maybe_checkpoint(
     store: &Arc<Mutex<DurableStore>>,
     stats: &AtomicStats,
     options: &GroupCommitOptions,
     checkpoint_sender: &SyncSender<BackgroundCheckpoint>,
+    pending_syncs: &AtomicUsize,
 ) {
     if options.checkpoint_after_wal_bytes == 0 {
         return;
     }
+    await_syncs(pending_syncs);
     let Ok(mut locked) = store.lock() else {
         return;
     };
@@ -459,7 +530,11 @@ fn explicit_checkpoint(store: &Mutex<DurableStore>) -> Result<Lsn> {
     }
 }
 
-fn execute_group(store: &Mutex<DurableStore>, stats: &AtomicStats, requests: Vec<CommitRequest>) {
+fn execute_group(
+    store: &Mutex<DurableStore>,
+    stats: &AtomicStats,
+    requests: Vec<CommitRequest>,
+) -> Option<PendingSync> {
     let request_count = requests.len();
     let page_count = requests.iter().map(CommitRequest::len).sum::<usize>();
     // Each request draws its LSNs from whichever list it contributed to.
@@ -482,11 +557,13 @@ fn execute_group(store: &Mutex<DurableStore>, stats: &AtomicStats, requests: Vec
         .flat_map(|request| request.appends.iter().cloned())
         .collect::<Vec<_>>();
 
-    let durable = requests.iter().any(|request| request.durable);
     let result = store
         .lock()
         .map_err(|_| StorageError::GroupCommit("store mutex is poisoned".to_owned()))
-        .and_then(|mut store| store.apply_batch(&writes, &appends, durable));
+        .and_then(|mut store| {
+            let lsns = store.apply_batch(&writes, &appends, false)?;
+            Ok((lsns, store.active_wal_handle()?))
+        });
 
     stats.groups.fetch_add(1, Ordering::Relaxed);
     stats
@@ -495,7 +572,8 @@ fn execute_group(store: &Mutex<DurableStore>, stats: &AtomicStats, requests: Vec
     stats.pages.fetch_add(page_count as u64, Ordering::Relaxed);
 
     match result {
-        Ok((write_lsns, append_lsns)) => {
+        Ok(((write_lsns, append_lsns), file)) => {
+            let mut replies = Vec::with_capacity(requests.len());
             for ((request, writes), appends) in
                 requests.into_iter().zip(write_spans).zip(append_spans)
             {
@@ -504,8 +582,9 @@ fn execute_group(store: &Mutex<DurableStore>, stats: &AtomicStats, requests: Vec
                 } else {
                     append_lsns[appends.0..appends.1].to_vec()
                 };
-                let _ = request.response.send(Ok(lsns));
+                replies.push((request.response, Ok(lsns)));
             }
+            Some(PendingSync { file, replies })
         }
         Err(error) => {
             let message = error.to_string();
@@ -514,6 +593,7 @@ fn execute_group(store: &Mutex<DurableStore>, stats: &AtomicStats, requests: Vec
                     .response
                     .send(Err(StorageError::GroupCommit(message.clone())));
             }
+            None
         }
     }
 }

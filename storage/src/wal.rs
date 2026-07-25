@@ -292,6 +292,11 @@ impl Wal {
         self.append(WalKind::BatchCommit { page_count })
     }
 
+    /// Callers must keep the segment alive while a sync is outstanding.
+    pub(crate) fn active_file(&self) -> Result<File> {
+        Ok(self.segments[self.active].file.try_clone()?)
+    }
+
     pub(crate) fn sync(&self) -> Result<()> {
         self.segments[self.active].file.sync_data()?;
         Ok(())

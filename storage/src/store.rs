@@ -369,6 +369,11 @@ impl DurableStore {
     }
 
     /// Open the lock-free read path for concurrent readers.
+    /// Syncing this makes the records just appended durable, without the lock.
+    pub fn active_wal_handle(&self) -> Result<File> {
+        self.wal.active_file()
+    }
+
     pub fn shared_reader(&self) -> Result<SharedReader> {
         Ok(SharedReader {
             dirty: std::sync::Arc::clone(&self.dirty),
