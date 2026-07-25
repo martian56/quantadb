@@ -181,11 +181,19 @@ jobs:
               "$loadgen" --seconds 10 --connections 4 --rows 5000 --read-percent "$2" > pass.txt
               cat pass.txt
               python .github/scripts/parse_loadgen.py "$1" pass.txt >> "${{ matrix.profile }}.jsonl"
+              # A baseline that misbehaves drops out; the report falls back
+              # to the cross run one rather than failing the job.
               if [ -n "$BASE_SERVER" ]; then
-                "$BASE_LOADGEN" --seconds 10 --connections 4 --rows 5000 \
-                  --read-percent "$2" --address 127.0.0.1:54322 > base.txt
-                python .github/scripts/parse_loadgen.py "$1" base.txt \
-                  >> "base/${{ matrix.profile }}.jsonl"
+                if "$BASE_LOADGEN" --seconds 10 --connections 4 --rows 5000 \
+                  --read-percent "$2" --address 127.0.0.1:54322 > base.txt \
+                  && python .github/scripts/parse_loadgen.py "$1" base.txt \
+                    >> "base/${{ matrix.profile }}.jsonl"; then
+                  :
+                else
+                  echo "baseline pass failed; dropping the paired baseline"
+                  rm -f "base/${{ matrix.profile }}.jsonl"
+                  BASE_SERVER=""
+                fi
               fi
             done
           }
