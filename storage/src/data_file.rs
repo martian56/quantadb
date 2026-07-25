@@ -5,8 +5,15 @@ use std::{
     path::Path,
 };
 
+/// How far ahead the data file is extended when it runs out of room.
+const GROW_BYTES: u64 = 8 << 20;
+
 pub(crate) struct DataFile {
     file: File,
+    /// Bytes the file occupies, including room reserved for future pages.
+    physical: u64,
+    /// Pages that hold something; the tail beyond this is reserved zeroes.
+    pages: u64,
 }
 
 impl DataFile {
@@ -26,7 +33,23 @@ impl DataFile {
             file.set_len(complete_length)?;
             file.seek(SeekFrom::Start(complete_length))?;
         }
-        Ok(Self { file })
+        // The tail may be room reserved by an earlier run rather than pages,
+        // so walk back over the zeroed ones to find where content ends.
+        let mut pages = complete_length / PAGE_SIZE as u64;
+        let mut bytes = [0_u8; PAGE_SIZE];
+        while pages > 0 {
+            let offset = (pages - 1) * PAGE_SIZE as u64;
+            read_exact_at(&file, &mut bytes, offset)?;
+            if bytes.iter().any(|byte| *byte != 0) {
+                break;
+            }
+            pages -= 1;
+        }
+        Ok(Self {
+            file,
+            physical: complete_length,
+            pages,
+        })
     }
 
     pub(crate) fn read(&mut self, page_id: PageId) -> Result<Option<Page>> {
@@ -43,9 +66,22 @@ impl DataFile {
     }
 
     pub(crate) fn write(&mut self, page: &Page) -> Result<()> {
+        let offset = page_offset(page.id())?;
+        let end = offset
+            .checked_add(PAGE_SIZE as u64)
+            .ok_or_else(|| StorageError::CorruptDataFile("page offset overflow".to_owned()))?;
+        // Extending a file a page at a time makes every fresh page pay a
+        // metadata update, so reserve room in large steps instead.
+        if end > self.physical {
+            let grown = end.saturating_add(GROW_BYTES);
+            self.file.set_len(grown)?;
+            self.physical = grown;
+        }
         // Positional writes only: the shared read handle moves the common
         // cursor on some platforms, so nothing here may depend on it.
-        write_all_at(&self.file, &page.encode(), page_offset(page.id())?)
+        write_all_at(&self.file, &page.encode(), offset)?;
+        self.pages = self.pages.max(end / PAGE_SIZE as u64);
+        Ok(())
     }
 
     pub(crate) fn sync(&self) -> Result<()> {
@@ -54,7 +90,7 @@ impl DataFile {
     }
 
     pub(crate) fn page_count(&self) -> Result<u64> {
-        Ok(self.file.metadata()?.len() / PAGE_SIZE as u64)
+        Ok(self.pages)
     }
 
     pub(crate) fn max_lsn(&mut self) -> Result<u64> {
@@ -158,6 +194,39 @@ fn page_offset(page_id: PageId) -> Result<u64> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn reserved_space_is_not_mistaken_for_pages_after_reopen() {
+        let directory = tempdir().expect("tempdir");
+        let path = directory.path().join("data.qdb");
+        {
+            let mut data = DataFile::open(&path).expect("open");
+            data.write(&Page::new(PageId(0), b"zero".to_vec()).expect("page"))
+                .expect("write");
+            data.write(&Page::new(PageId(1), b"one".to_vec()).expect("page"))
+                .expect("write");
+            assert_eq!(data.page_count().expect("count"), 2);
+            assert!(
+                data.file.metadata().expect("meta").len() > 2 * PAGE_SIZE as u64,
+                "the file reserves room beyond the pages written"
+            );
+        }
+
+        let mut reopened = DataFile::open(&path).expect("reopen");
+        assert_eq!(
+            reopened.page_count().expect("count"),
+            2,
+            "the reserved tail must not count as pages"
+        );
+        assert_eq!(
+            reopened
+                .read(PageId(1))
+                .expect("read")
+                .expect("page")
+                .payload(),
+            b"one"
+        );
+    }
 
     #[test]
     fn sparse_pages_round_trip_and_holes_are_absent() {
