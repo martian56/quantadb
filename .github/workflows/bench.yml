@@ -87,6 +87,22 @@ jobs:
         with:
           name: bin-${{ matrix.platform }}
           path: bin
+      - name: Fetch baseline binaries
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          run=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow bench.yml \
+            --branch main --status success --limit 1 --json databaseId \
+            -q '.[0].databaseId' || true)
+          if [ -z "$run" ]; then
+            echo "no baseline build to pair against"
+            exit 0
+          fi
+          gh run download "$run" --repo "$GITHUB_REPOSITORY" \
+            --name bin-${{ matrix.platform }} --dir bin-base || \
+            echo "baseline binaries expired"
       - name: Start server
         shell: bash
         run: |
@@ -122,18 +138,54 @@ jobs:
           echo "server never came up"
           if [ "${{ matrix.mode }}" = "docker" ]; then docker logs qserver; fi
           exit 1
+      - name: Start baseline server
+        if: github.event_name == 'pull_request' && matrix.mode == 'native'
+        shell: bash
+        run: |
+          base=bin-base/quantadb-server
+          [ -f "$base" ] || base=bin-base/quantadb-server.exe
+          if [ ! -f "$base" ]; then
+            echo "no baseline binary; this run reports absolute numbers only"
+            exit 0
+          fi
+          chmod +x bin-base/* 2>/dev/null || true
+          mkdir -p "$RUNNER_TEMP/qbase"
+          QUANTA_DATA_DIR="$RUNNER_TEMP/qbase" \
+          QUANTA_LISTEN_ADDRESS=127.0.0.1:54322 \
+          QUANTA_PG_LISTEN_ADDRESS=off \
+          QUANTA_HTTP_LISTEN_ADDRESS=off \
+          "$base" &
+          for _ in $(seq 1 60); do
+            if (exec 3<>/dev/tcp/127.0.0.1/54322) 2>/dev/null; then
+              exec 3>&- || true
+              sleep 2
+              baseloadgen=bin-base/loadgen
+              [ -f "$baseloadgen" ] || baseloadgen=bin-base/loadgen.exe
+              echo "BASE_SERVER=1" >> "$GITHUB_ENV"
+              echo "BASE_LOADGEN=$baseloadgen" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "baseline server never came up; reporting absolute numbers only"
       - name: Run workloads
         shell: bash
         run: |
           loadgen=bin/loadgen
           [ -f "$loadgen" ] || loadgen=bin/loadgen.exe
-          # Three passes per workload; the report takes the median, because a
-          # single pass cannot resolve anything under about a third.
+          # Runner speed varies far more between jobs than between passes, so
+          # both builds run here, interleaved, and are compared to each other.
           run_pass() {
             for attempt in 1 2 3; do
               "$loadgen" --seconds 10 --connections 4 --rows 5000 --read-percent "$2" > pass.txt
               cat pass.txt
               python .github/scripts/parse_loadgen.py "$1" pass.txt >> "${{ matrix.profile }}.jsonl"
+              if [ -n "$BASE_SERVER" ]; then
+                "$BASE_LOADGEN" --seconds 10 --connections 4 --rows 5000 \
+                  --read-percent "$2" --address 127.0.0.1:54322 > base.txt
+                python .github/scripts/parse_loadgen.py "$1" base.txt \
+                  >> "baseline-${{ matrix.profile }}.jsonl"
+              fi
             done
           }
           run_pass reads 100
@@ -152,6 +204,12 @@ jobs:
           name: result-${{ matrix.profile }}
           path: ${{ matrix.profile }}.jsonl
           if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: hashFiles(format('baseline-{0}.jsonl', matrix.profile)) != ''
+        with:
+          name: paired-${{ matrix.profile }}
+          path: baseline-${{ matrix.profile }}.jsonl
+          if-no-files-found: ignore
 
   report:
     needs: bench
@@ -164,6 +222,10 @@ jobs:
         with:
           pattern: result-*
           path: results
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: paired-*
+          path: paired
       - name: Fetch baseline from main
         if: github.event_name == 'pull_request'
         env:
@@ -204,6 +266,11 @@ jobs:
         run: |
           sha=$(cat baseline-sha.txt 2>/dev/null || echo "")
           stamp=$(cat reference-stamp.txt 2>/dev/null || echo "never")
+          # A baseline measured on the same runner beats one from another job.
+          if [ -n "$(ls paired 2>/dev/null)" ]; then
+            rm -rf baseline && mv paired baseline
+            sha="same runner"
+          fi
           python .github/scripts/bench_report.py results baseline comment.md "$sha" reference "$stamp"
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
       - name: Post sticky comment
