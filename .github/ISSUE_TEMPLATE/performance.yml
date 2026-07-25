@@ -1,0 +1,49 @@
+name: Performance
+description: Something is slower than it should be
+labels: ["performance"]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Performance work here is decided by measurement, so this template asks
+        for numbers. A report without them is still welcome, but it will start
+        by someone trying to reproduce what you saw.
+  - type: textarea
+    id: observed
+    attributes:
+      label: What you measured
+      description: >
+        Throughput or latency, the workload that produced it, and what you
+        expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: how
+    attributes:
+      label: How you measured it
+      description: >
+        The client, the concurrency, the row count, and how long each run
+        lasted. If you used loadgen or the field driver, the exact flags.
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware and storage
+      description: >
+        CPU count, memory, and what the data directory sits on. Flush cost
+        varies by orders of magnitude between an SSD, a spinning disk and a
+        container volume, and it usually explains the result.
+      placeholder: 4 vCPU, 8 GiB, NVMe SSD, ext4
+    validations:
+      required: true
+  - type: dropdown
+    id: repeated
+    attributes:
+      label: Did you run it more than once?
+      options:
+        - "Yes, and the runs agreed"
+        - "Yes, and the runs disagreed"
+        - "No, one run"
+    validations:
+      required: true

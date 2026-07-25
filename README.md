@@ -1,4 +1,10 @@
+<img src="web/logo.svg" width="72" height="72" alt="">
+
 # QuantaDB
+
+[![Core](https://github.com/martian56/quantadb/actions/workflows/core.yml/badge.svg)](https://github.com/martian56/quantadb/actions/workflows/core.yml)
+[![Bench](https://github.com/martian56/quantadb/actions/workflows/bench.yml/badge.svg)](https://github.com/martian56/quantadb/actions/workflows/bench.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 QuantaDB is an experimental relational database being rebuilt in Rust around
 three non-negotiable goals:
@@ -130,6 +136,21 @@ Logging is controlled with the standard `RUST_LOG` environment variable.
 The target is a Linux-first, durable, single-node OLTP database with
 PostgreSQL-compatible client support. Distributed operation comes after
 single-node recovery, transactions, and replication are trustworthy.
+
+## Contributing
+
+Small, measured changes are the useful ones. [CONTRIBUTING.md](CONTRIBUTING.md)
+covers the setup and what a good pull request looks like; the short version is
+that performance claims are settled by the bench matrix rather than by a local
+run, because local timings on this project have repeatedly pointed the wrong
+way.
+
+Security reports go to the address in [SECURITY.md](SECURITY.md), not the issue
+tracker.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
 
 See [the architecture roadmap](docs/architecture.md) for milestone boundaries,
 [the MVCC design](docs/mvcc.md) for transaction semantics, the
