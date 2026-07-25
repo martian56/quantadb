@@ -17,7 +17,7 @@ const NO_PAGE_ID: u64 = u64::MAX;
 /// in place, so the routine commit sync never touches file metadata.
 /// Growing a file on every append makes each sync journal a size change,
 /// which measured six times slower than syncing data blocks alone.
-const WAL_PREALLOCATE_BYTES: u64 = 64 << 20;
+const WAL_PREALLOCATE_BYTES: u64 = 16 << 20;
 /// How far ahead of the append position a segment is zero-filled.
 ///
 /// Reserving length with set_len leaves a sparse file, and writing into a

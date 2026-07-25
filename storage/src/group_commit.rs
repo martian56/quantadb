@@ -44,7 +44,7 @@ impl Default for GroupCommitOptions {
             queue_depth: 1_024,
             max_batch_pages: 256,
             max_delay: Duration::from_micros(200),
-            checkpoint_after_wal_bytes: 64 << 20,
+            checkpoint_after_wal_bytes: 12 << 20,
             flush_pages_per_batch: 32,
         }
     }
