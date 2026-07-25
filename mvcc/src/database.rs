@@ -804,21 +804,17 @@ impl Inner {
                             sealed: true,
                         });
                     }
-                    let page_id = self
-                        .storage
-                        .reserve_page_ids(1)?
-                        .into_iter()
-                        .next()
-                        .ok_or(TransactionError::TimestampExhausted)?;
-                    // A page off the free pool still holds the records of its
-                    // previous life. Blank it here, while the open page lock
-                    // is held, so it is empty before any writer can append to
-                    // it. Clearing it as part of an append would depend on
-                    // which writer reached the log first.
-                    self.storage.commit_relaxed(vec![PageWrite {
-                        page_id,
-                        payload: Vec::new(),
-                    }])?;
+                    let (page_id, reused) = self.storage.reserve_one_page()?;
+                    // Only a recycled page carries records from a previous
+                    // life. A fresh one is past the end of the file and reads
+                    // as empty, so it needs no blanking and no round trip
+                    // while this lock is held.
+                    if reused {
+                        self.storage.commit_relaxed(vec![PageWrite {
+                            page_id,
+                            payload: Vec::new(),
+                        }])?;
+                    }
                     *open = Some(OpenPage { page_id, offset: 0 });
                 }
                 let page = open.as_mut().expect("a page is open");
