@@ -17,14 +17,17 @@ FIELD_ENGINES = ["quantadb", "postgres18", "mariadb114", "mysql84"]
 def load_profiles(directory):
     profiles = {}
     for path in sorted(pathlib.Path(directory).rglob("*.jsonl")):
-        records = {}
+        passes = {}
         for line in path.read_text(encoding="utf-8").splitlines():
             if line.strip():
                 record = json.loads(line)
                 key = record.get("engine"), record["workload"]
-                records[key] = record
-        if records:
-            profiles[path.stem] = records
+                passes.setdefault(key, []).append(record)
+        if passes:
+            profiles[path.stem] = {
+                key: sorted(runs, key=lambda run: run["ops_per_s"])[len(runs) // 2]
+                for key, runs in passes.items()
+            }
     return profiles
 
 

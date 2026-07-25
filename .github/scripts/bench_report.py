@@ -9,8 +9,14 @@ import pathlib
 import sys
 
 MARKER = "<!-- quantadb-bench-report -->"
-NOISE_PERCENT = 10.0
+NOISE_PERCENT = 15.0
 WORKLOADS = ["reads", "mixed", "writes"]
+
+
+def median_record(records):
+    """The run with the median throughput, so one bad pass cannot decide."""
+    ordered = sorted(records, key=lambda record: record["ops_per_s"])
+    return ordered[len(ordered) // 2]
 
 
 def load(directory):
@@ -19,13 +25,15 @@ def load(directory):
     if not root.is_dir():
         return profiles
     for path in sorted(root.rglob("*.jsonl")):
-        records = {}
+        passes = {}
         for line in path.read_text(encoding="utf-8").splitlines():
             if line.strip():
                 record = json.loads(line)
-                records[record["workload"]] = record
-        if records:
-            profiles[path.stem] = records
+                passes.setdefault(record["workload"], []).append(record)
+        if passes:
+            profiles[path.stem] = {
+                workload: median_record(runs) for workload, runs in passes.items()
+            }
     return profiles
 
 

@@ -80,7 +80,7 @@ jobs:
             mode: native
     name: Bench ${{ matrix.profile }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -127,10 +127,14 @@ jobs:
         run: |
           loadgen=bin/loadgen
           [ -f "$loadgen" ] || loadgen=bin/loadgen.exe
+          # Three passes per workload; the report takes the median, because a
+          # single pass cannot resolve anything under about a third.
           run_pass() {
-            "$loadgen" --seconds 10 --connections 4 --rows 5000 --read-percent "$2" > pass.txt
-            cat pass.txt
-            python .github/scripts/parse_loadgen.py "$1" pass.txt >> "${{ matrix.profile }}.jsonl"
+            for attempt in 1 2 3; do
+              "$loadgen" --seconds 10 --connections 4 --rows 5000 --read-percent "$2" > pass.txt
+              cat pass.txt
+              python .github/scripts/parse_loadgen.py "$1" pass.txt >> "${{ matrix.profile }}.jsonl"
+            done
           }
           run_pass reads 100
           run_pass mixed 80
