@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/martian56/quantadb/security/policy
+    about: Do not open a public issue. Report it privately instead.
+  - name: Benchmark methodology
+    url: https://github.com/martian56/quantadb/blob/main/docs/benchmarks.md
+    about: How performance is measured here, and why single runs are not trusted.

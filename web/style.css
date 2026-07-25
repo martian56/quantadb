@@ -595,3 +595,14 @@ main {
     scroll-behavior: auto;
   }
 }
+
+.wordmark {
+  display: inline-flex;
+  align-items: center;
+  gap: .5ch;
+}
+
+.wordmark-mark {
+  display: block;
+  border-radius: 5px;
+}

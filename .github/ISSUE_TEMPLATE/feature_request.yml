@@ -1,0 +1,22 @@
+name: Feature or SQL support
+description: Something QuantaDB cannot do yet
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What you are trying to do
+      description: >
+        The problem, rather than the feature. It often turns out there is a
+        shorter way to solve it.
+    validations:
+      required: true
+  - type: textarea
+    id: shape
+    attributes:
+      label: What it might look like
+      description: The SQL, the API, or the protocol behaviour you have in mind.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: How you work around it today
