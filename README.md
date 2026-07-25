@@ -93,12 +93,7 @@ Start the server:
 cargo run -p quantadb-server
 ```
 
-It listens on `127.0.0.1:54321` for the native protocol and on
-`127.0.0.1:55432` for Postgres clients:
-
-```bash
-psql "host=127.0.0.1 port=55432 user=quanta dbname=quanta"
-```
+It listens on `127.0.0.1:6626`.
 
 ## Protocol example
 
@@ -119,8 +114,7 @@ request ID.
 
 | Variable | Default |
 |---|---:|
-| `QUANTA_LISTEN_ADDRESS` | `127.0.0.1:54321` |
-| `QUANTA_PG_LISTEN_ADDRESS` | `127.0.0.1:55432` |
+| `QUANTA_LISTEN_ADDRESS` | `127.0.0.1:6626` |
 | `QUANTA_HTTP_LISTEN_ADDRESS` | off |
 | `QUANTA_DATA_DIR` | `quantadb-data` |
 | `QUANTA_MAX_CONNECTIONS` | `1024` |

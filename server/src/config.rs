@@ -11,7 +11,6 @@ const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 5;
 pub struct ServerConfig {
     pub listen_address: SocketAddr,
     /// Where the PostgreSQL wire protocol listens; None disables it.
-    pub pg_listen_address: Option<SocketAddr>,
     /// Where the HTTP bridge listens; None, the default, disables it.
     pub http_listen_address: Option<SocketAddr>,
     pub data_directory: PathBuf,
@@ -25,8 +24,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            listen_address: SocketAddr::from(([127, 0, 0, 1], 54_321)),
-            pg_listen_address: Some(SocketAddr::from(([127, 0, 0, 1], 55_432))),
+            listen_address: SocketAddr::from(([127, 0, 0, 1], 6_626)),
             http_listen_address: None,
             data_directory: PathBuf::from("quantadb-data"),
             max_connections: DEFAULT_MAX_CONNECTIONS,
@@ -49,17 +47,6 @@ impl ServerConfig {
                     "QUANTA_LISTEN_ADDRESS must be an IP socket address: {error}"
                 ))
             })?;
-        }
-        if let Some(value) = read_env("QUANTA_PG_LISTEN_ADDRESS")? {
-            config.pg_listen_address = if value.eq_ignore_ascii_case("off") {
-                None
-            } else {
-                Some(value.parse().map_err(|error| {
-                    ServerError::Configuration(format!(
-                        "QUANTA_PG_LISTEN_ADDRESS must be an IP socket address or \"off\": {error}"
-                    ))
-                })?)
-            };
         }
         if let Some(value) = read_env("QUANTA_HTTP_LISTEN_ADDRESS")? {
             config.http_listen_address = if value.eq_ignore_ascii_case("off") {

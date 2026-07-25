@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 const USAGE: &str = "loadgen: mixed point workload for a running QuantaDB server
 
 Options:
-  --address HOST:PORT   server address (default 127.0.0.1:54321)
+  --address HOST:PORT   server address (default 127.0.0.1:6626)
   --connections N       concurrent client connections (default 8)
   --seconds N           measured run time (default 10)
   --read-percent N      share of reads in the mix, 0 to 100 (default 80)
@@ -30,7 +30,7 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            address: "127.0.0.1:54321".to_owned(),
+            address: "127.0.0.1:6626".to_owned(),
             connections: 8,
             seconds: 10,
             read_percent: 80,

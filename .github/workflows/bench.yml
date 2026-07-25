@@ -111,10 +111,9 @@ jobs:
           if [ "${{ matrix.mode }}" = "docker" ]; then
             docker run -d --name qserver \
               --cpus ${{ matrix.cpus }} --memory ${{ matrix.memory }} \
-              -p 54321:54321 \
+              -p 6626:6626 \
               -e QUANTA_DATA_DIR=/data \
-              -e QUANTA_LISTEN_ADDRESS=0.0.0.0:54321 \
-              -e QUANTA_PG_LISTEN_ADDRESS=off \
+              -e QUANTA_LISTEN_ADDRESS=0.0.0.0:6626 \
               -e QUANTA_HTTP_LISTEN_ADDRESS=off \
               -v "$RUNNER_TEMP/qdata:/data" \
               -v "$PWD/bin:/app:ro" \
@@ -123,12 +122,11 @@ jobs:
             server=bin/quantadb-server
             [ -f "$server" ] || server=bin/quantadb-server.exe
             QUANTA_DATA_DIR="$RUNNER_TEMP/qdata" \
-            QUANTA_PG_LISTEN_ADDRESS=off \
             QUANTA_HTTP_LISTEN_ADDRESS=off \
             "$server" &
           fi
           for _ in $(seq 1 60); do
-            if (exec 3<>/dev/tcp/127.0.0.1/54321) 2>/dev/null; then
+            if (exec 3<>/dev/tcp/127.0.0.1/6626) 2>/dev/null; then
               exec 3>&- || true
               sleep 2
               exit 0
@@ -151,12 +149,11 @@ jobs:
           chmod +x bin-base/* 2>/dev/null || true
           mkdir -p "$RUNNER_TEMP/qbase"
           QUANTA_DATA_DIR="$RUNNER_TEMP/qbase" \
-          QUANTA_LISTEN_ADDRESS=127.0.0.1:54322 \
-          QUANTA_PG_LISTEN_ADDRESS=off \
+          QUANTA_LISTEN_ADDRESS=127.0.0.1:6627 \
           QUANTA_HTTP_LISTEN_ADDRESS=off \
           "$base" &
           for _ in $(seq 1 60); do
-            if (exec 3<>/dev/tcp/127.0.0.1/54322) 2>/dev/null; then
+            if (exec 3<>/dev/tcp/127.0.0.1/6627) 2>/dev/null; then
               exec 3>&- || true
               sleep 2
               baseloadgen=bin-base/loadgen
@@ -185,7 +182,7 @@ jobs:
               # to the cross run one rather than failing the job.
               if [ -n "$BASE_SERVER" ]; then
                 if "$BASE_LOADGEN" --seconds 10 --connections 4 --rows 5000 \
-                  --read-percent "$2" --address 127.0.0.1:54322 > base.txt \
+                  --read-percent "$2" --address 127.0.0.1:6627 > base.txt \
                   && python .github/scripts/parse_loadgen.py "$1" base.txt \
                     >> "base/${{ matrix.profile }}.jsonl"; then
                   :
