@@ -173,6 +173,7 @@ jobs:
         run: |
           loadgen=bin/loadgen
           [ -f "$loadgen" ] || loadgen=bin/loadgen.exe
+          mkdir -p base
           # Runner speed varies far more between jobs than between passes, so
           # both builds run here, interleaved, and are compared to each other.
           run_pass() {
@@ -184,7 +185,7 @@ jobs:
                 "$BASE_LOADGEN" --seconds 10 --connections 4 --rows 5000 \
                   --read-percent "$2" --address 127.0.0.1:54322 > base.txt
                 python .github/scripts/parse_loadgen.py "$1" base.txt \
-                  >> "baseline-${{ matrix.profile }}.jsonl"
+                  >> "base/${{ matrix.profile }}.jsonl"
               fi
             done
           }
@@ -205,10 +206,9 @@ jobs:
           path: ${{ matrix.profile }}.jsonl
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
-        if: hashFiles(format('baseline-{0}.jsonl', matrix.profile)) != ''
         with:
           name: paired-${{ matrix.profile }}
-          path: baseline-${{ matrix.profile }}.jsonl
+          path: base/${{ matrix.profile }}.jsonl
           if-no-files-found: ignore
 
   report:
